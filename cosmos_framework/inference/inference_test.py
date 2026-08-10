@@ -10,6 +10,81 @@ from unittest.mock import Mock
 import pytest
 
 
+def test_finalize_data_batch_does_not_mutate_reusable_video_list() -> None:
+    torch = pytest.importorskip("torch")
+
+    from cosmos_framework.inference.inference import _finalize_data_batch
+
+    model = SimpleNamespace(input_video_key="video", input_image_key="images", input_caption_key="caption")
+    original_video = torch.zeros(3, 2, 4, 4, dtype=torch.uint8)
+    source_batch = {"video": [original_video], "caption": ["prompt"]}
+
+    first_pass = _finalize_data_batch(source_batch, batch_size=1, model=model)
+    first_pass["video"][0] = first_pass["video"][0].float() / 127.5 - 1.0
+    first_pass["is_preprocessed"] = True
+    second_pass = _finalize_data_batch(source_batch, batch_size=1, model=model)
+
+    assert first_pass["video"] is not source_batch["video"]
+    assert second_pass["video"] is not source_batch["video"]
+    assert source_batch["video"][0] is original_video
+    assert source_batch["video"][0].dtype == torch.uint8
+    assert "is_preprocessed" not in source_batch
+
+
+def test_compute_num_tokens_uses_config_when_vision_tokenizer_is_not_loaded() -> None:
+    from cosmos_framework.inference.inference import _compute_num_tokens_for_sample
+
+    model = SimpleNamespace(
+        tokenizer_vision_gen=None,
+        config=SimpleNamespace(
+            tokenizer=SimpleNamespace(
+                spatial_compression_factor=16,
+                temporal_compression_factor=4,
+            ),
+            diffusion_expert_config=SimpleNamespace(patch_spatial=2),
+        ),
+    )
+    sample_args = SimpleNamespace(vision_size=(256, 128), num_frames=9)
+
+    assert _compute_num_tokens_for_sample(sample_args, model) == 96
+
+
+def test_separate_vision_decode_gpu_is_ignored_without_vision_tokenizer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from cosmos_framework.inference import inference
+    from cosmos_framework.inference.args import DEFAULT_CHECKPOINT_NAME, OmniSetupOverrides
+    from cosmos_framework.inference.common.args import ConfigFileType
+
+    setup_args = OmniSetupOverrides(
+        checkpoint_path=DEFAULT_CHECKPOINT_NAME,
+        output_dir=tmp_path / "outputs",
+        guardrails=False,
+        use_separate_pipeline_vision_decode_gpu=True,
+    ).build_setup(world_size=1, local_world_size=1, device_memory_bytes=80 * 1024**3)
+    setup_args.config_file_type = ConfigFileType.MODULE
+
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            rectified_flow_inference_config=SimpleNamespace(scheduler_type=setup_args.sampler),
+        ),
+        tokenizer_vision_gen=None,
+    )
+    load_model = Mock(return_value=SimpleNamespace(model=model))
+    device_count = Mock(side_effect=AssertionError("separate VAE setup should not inspect CUDA devices"))
+    monkeypatch.setattr(inference, "_download_on_rank0", lambda _download: tmp_path)
+    monkeypatch.setattr(inference.Cosmos3OmniModel, "from_pretrained_dcp", load_model)
+    monkeypatch.setattr(inference.torch.cuda, "device_count", device_count)
+
+    pipe = inference.OmniInference._create(setup_args, guardrails=None, _timer=None)
+
+    assert pipe.model is model
+    assert pipe.vae_decode_stream is None
+    load_model.assert_called_once()
+    device_count.assert_not_called()
+
+
 def _make_v2v_sample_args(**overrides: Any) -> SimpleNamespace:
     """v2v ``OmniSampleArgs`` stand-in for ``get_sample_data`` tests."""
     from cosmos_framework.inference.args import ModelMode, NegativeMetadataMode
@@ -169,6 +244,7 @@ def _make_reasoner_sample_args(**overrides: Any) -> SimpleNamespace:
         model_mode=ModelMode.REASONER,
         prompt="Describe a robotic arm.",
         vision_path=None,
+        video_fps=None,
         max_new_tokens=8,
         do_sample=False,
         temperature=1.0,
@@ -189,7 +265,11 @@ def test_get_sample_data_reasoner_text_only() -> None:
 
     out = inference.get_sample_data(sample_args, model, device="cpu")
 
-    assert out == {"caption": ["Describe a robotic arm."], "reasoner_images": [None]}
+    assert out == {
+        "caption": ["Describe a robotic arm."],
+        "reasoner_images": [None],
+        "reasoner_videos": [None],
+    }
 
 
 @pytest.mark.L0
@@ -205,11 +285,32 @@ def test_get_sample_data_reasoner_with_image(tmp_path: Path) -> None:
 
     out = inference.get_sample_data(sample_args, model, device="cpu")
 
-    assert list(out) == ["caption", "reasoner_images"]
+    assert list(out) == ["caption", "reasoner_images", "reasoner_videos"]
     assert out["caption"] == ["Describe a robotic arm."]
+    assert out["reasoner_videos"] == [None]
     assert len(out["reasoner_images"]) == 1
     assert out["reasoner_images"][0].size == (8, 8)
     assert out["reasoner_images"][0].mode == "RGB"
+
+
+@pytest.mark.L0
+def test_get_sample_data_reasoner_with_video(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A video ``vision_path`` routes through ``_decode_reasoner_video`` into ``reasoner_videos``.
+
+    The decoder is monkeypatched (real decode needs torchvision + an actual clip);
+    this asserts the routing/contract, not the decode itself."""
+    from cosmos_framework.inference import inference
+
+    decoded = {"frames": ["F0", "F1"], "fps": 2.0}
+    monkeypatch.setattr(inference, "_decode_reasoner_video", lambda path, fps: decoded)
+    model = SimpleNamespace(input_caption_key="caption")
+    sample_args = _make_reasoner_sample_args(vision_path="/tmp/clip.mp4", video_fps=2.0)
+
+    out = inference.get_sample_data(sample_args, model, device="cpu")
+
+    assert out["caption"] == ["Describe a robotic arm."]
+    assert out["reasoner_videos"] == [decoded]
+    assert out["reasoner_images"] == [None]
 
 
 @pytest.mark.L0
@@ -220,7 +321,7 @@ def test_reasoner_defaults_json_round_trip() -> None:
 
     defaults = _load_modality_defaults("reasoner")
     assert defaults["model_mode"] == "reasoner"
-    assert defaults["max_new_tokens"] == 64
+    assert defaults["max_new_tokens"] == 1024
     on_disk = _json.loads((PACKAGE_DIR / "defaults/reasoner/sample_args.json").read_text())
     assert defaults == on_disk
 
@@ -297,7 +398,7 @@ def test_generate_reasoner_batch_writes_outputs(tmp_path: Path) -> None:
     pipe._get_timer = lambda *_a, **_kw: nullcontext()  # type: ignore[attr-defined]
 
     data_batch = {"caption": ["Describe a robotic arm."], "reasoner_images": [None]}
-    results = pipe._generate_reasoner_batch([sample_args], data_batch, warmup=False)
+    results = pipe._generate_reasoner_batch([sample_args], data_batch)
 
     assert len(results) == 1
     so = results[0]
@@ -326,7 +427,7 @@ def test_generate_reasoner_batch_rejects_mixed_image_text_only(tmp_path: Path) -
         "reasoner_images": [PIL.new("RGB", (8, 8)), None],
     }
     with pytest.raises(ValueError, match="mixes image-conditioned and text-only"):
-        pipe._generate_reasoner_batch([sa1, sa2], data_batch, warmup=False)
+        pipe._generate_reasoner_batch([sa1, sa2], data_batch)
 
 
 @pytest.mark.L0

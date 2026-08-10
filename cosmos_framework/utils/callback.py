@@ -69,9 +69,21 @@ class CallBackGroup:
                     continue
                 log.critical(f"Instantiating callback {callback_name}: {current_callback_cfg}")
                 _callback = instantiate(current_callback_cfg)
-                assert isinstance(_callback, Callback), f"{current_callback_cfg} is not a valid callback."
-                _callback.config = config
-                _callback.trainer = trainer
+                if not isinstance(_callback, Callback):
+                    missing_hooks = _missing_callback_hooks(_callback)
+                    if missing_hooks:
+                        raise TypeError(
+                            f"{current_callback_cfg} is not a valid callback; "
+                            f"missing required callback hooks: {', '.join(missing_hooks)}"
+                        )
+                try:
+                    _callback.config = config
+                    _callback.trainer = trainer
+                except (AttributeError, TypeError) as error:
+                    raise TypeError(
+                        f"{current_callback_cfg} is not a valid callback; "
+                        "cannot assign required callback metadata 'config' and 'trainer'"
+                    ) from error
                 self._callbacks.append(_callback)
 
     def __getattr__(self, method_name: str) -> Callable:
@@ -294,6 +306,15 @@ class Callback:
         pass
 
 
+def _missing_callback_hooks(callback: object) -> list[str]:
+    """Return required callback hooks that are absent or non-callable."""
+    return sorted(
+        name
+        for name, member in vars(Callback).items()
+        if name.startswith("on_") and callable(member) and not callable(getattr(callback, name, None))
+    )
+
+
 class EMAModelCallback(Callback):
     """The callback class for tracking EMA model weights."""
 
@@ -391,7 +412,7 @@ class IterationLoggerCallback(Callback):
         loss: torch.Tensor,
         iteration: int = 0,
     ) -> None:
-
+        # FIXME - this is not correct when using gradient accumulation since self.start_iteration_time is updated every batch
         # but this is only called when the optimizer is updated, so it's only the time for the last batch.
         self.elapsed_iteration_time += time.time() - self.start_iteration_time
 
@@ -600,3 +621,4 @@ class NVTXCallback(Callback):
         torch.cuda.nvtx.range_pop()
 
 
+# End of callback definitions.

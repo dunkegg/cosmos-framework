@@ -6,7 +6,7 @@ import math
 import os
 from functools import cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, Self, cast, override
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, Self, Sequence, cast, override
 
 import pydantic
 import pynvml
@@ -41,6 +41,27 @@ if TYPE_CHECKING:
     from cosmos_framework.inference.common.inference import Inference
 
 
+def _load_transfer_prompt_path(path: str | Path) -> str:
+    """Load a transfer prompt from a ``.json`` or plain ``.txt`` file."""
+    resolved = Path(path)
+    text = resolved.read_text()
+    if resolved.suffix.lower() == ".json":
+        return json.dumps(json.loads(text))
+    return text.strip()
+
+
+def _load_transfer_negative_prompt_file(path: str | Path) -> str:
+    """Load a JSON negative caption file for transfer inference."""
+    candidate = Path(path)
+    if not candidate.is_file():
+        defaults_path = PACKAGE_DIR / "defaults" / candidate.name
+        if defaults_path.is_file():
+            candidate = defaults_path
+        else:
+            raise FileNotFoundError(f"Missing negative prompt file: {path} (also checked {defaults_path})")
+    return json.dumps(json.loads(candidate.read_text()))
+
+
 @cache
 def _load_modality_defaults(model_mode: str) -> dict[str, Any]:
     default_file = PACKAGE_DIR / f"defaults/{model_mode}/sample_args.json"
@@ -59,6 +80,7 @@ def _load_modality_defaults(model_mode: str) -> dict[str, Any]:
 Guidance = Annotated[float, pydantic.Field(ge=0, le=7)]
 GuidanceInterval = tuple[pydantic.NonNegativeFloat, pydantic.NonNegativeFloat]
 PromptUpsamplerProbability = Annotated[float, pydantic.Field(ge=0, le=1)]
+ControlGuidance = Annotated[float, pydantic.Field(ge=0, le=10)]
 
 
 class SamplingArgs(ArgsBase):
@@ -138,11 +160,12 @@ class ModelMode(StrEnum):
     IMAGE2IMAGE = "image2image"
     IMAGE2VIDEO = "image2video"
     VIDEO2VIDEO = "video2video"
+    AUDIO_IMAGE2VIDEO = "audio_image2video"
 
     # Action
     FORWARD_DYNAMICS = "forward_dynamics"
     INVERSE_DYNAMICS = "inverse_dynamics"
-    POLICY = "policy"
+    WAM = "wam"
 
     REASONER = "reasoner"
 
@@ -154,16 +177,29 @@ class ModelMode(StrEnum):
     def is_reasoner(self) -> bool:
         return self in REASONER_MODEL_MODES
 
+    @property
+    def is_sound_condition(self) -> bool:
+        return self in SOUND_CONDITION_MODEL_MODES
+
 
 # Image-output modes: ``num_frames`` defaults to 1 and the output is saved as a still image.
 _IMAGE_OUTPUT_MODES: frozenset[ModelMode] = frozenset({ModelMode.TEXT2IMAGE, ModelMode.IMAGE2IMAGE})
 
 # Modes that produce action tensors and require a model with ``action_gen=True``.
 ACTION_MODEL_MODES: frozenset[ModelMode] = frozenset(
-    {ModelMode.FORWARD_DYNAMICS, ModelMode.INVERSE_DYNAMICS, ModelMode.POLICY}
+    {ModelMode.FORWARD_DYNAMICS, ModelMode.INVERSE_DYNAMICS, ModelMode.WAM}
 )
 
 REASONER_MODEL_MODES: frozenset[ModelMode] = frozenset({ModelMode.REASONER})
+
+# Modes that condition generation on a real input audio clip (require a model
+# with ``sound_gen=True`` and a ``sound_path``).
+SOUND_CONDITION_MODEL_MODES: frozenset[ModelMode] = frozenset({ModelMode.AUDIO_IMAGE2VIDEO})
+
+
+def is_reasoner_only(sample_overrides: Sequence["OmniSampleOverrides"]) -> bool:
+    """Return whether every requested sample uses the reasoner-only path."""
+    return bool(sample_overrides) and all(sample.sample_meta.model_mode.is_reasoner for sample in sample_overrides)
 
 
 class VisionMode(StrEnum):
@@ -215,6 +251,16 @@ class TransferArgs(ArgsBase):
     """Resolved transfer inference arguments for a single control hint."""
 
     control_path: ResolvedFilePathOrUrl | None = None
+    weight: float = 1.0
+    """Strength of this control signal in the weighted multi-control attention aggregation."""
+
+    @pydantic.field_validator("weight", mode="before")
+    @classmethod
+    def _coerce_none_weight(cls, v: float | None) -> float:
+        # ``TransferOverrides.weight`` defaults to None ("unset") and is resolved into
+        # this required float via ``_build`` (which does not strip None). An unset weight
+        # resolves to the neutral 1.0 → equal weighting / single-control parity.
+        return 1.0 if v is None else v
 
 
 class EdgeTransferArgs(TransferArgs):
@@ -230,6 +276,9 @@ class TransferOverrides(OverridesBase):
 
     control_path: ResolvedFilePathOrUrl | None = None
     """Path or URL to pre-computed control input."""
+
+    weight: float | None = None
+    """Override the control weight for multi-control weighted attention aggregation."""
 
     def download(self, output_dir: Path):
         if self.control_path is not None:
@@ -300,7 +349,11 @@ class TextDataOverrides(OverridesBase):
         if self.prompt is not None:
             pass
         elif self.prompt_path is not None:
-            self.prompt = self.prompt_path.read_text().strip()
+            transfer_self = cast("_TransferDataBase", self)
+            if transfer_self.transfer_hints:
+                self.prompt = _load_transfer_prompt_path(self.prompt_path)
+            else:
+                self.prompt = self.prompt_path.read_text().strip()
         else:
             self.prompt = ""
 
@@ -371,7 +424,7 @@ class VisionDataArgs(ArgsBase, _VisionDataBase):
         autodetect via cosmos_framework.inference.vision.read_and_resize_media before reaching
         this property and never observe the fallback.
         """
-        from cosmos_framework.data.vfm.utils import IMAGE_RES_SIZE_INFO, VIDEO_RES_SIZE_INFO
+        from cosmos_framework.data.generator.utils import IMAGE_RES_SIZE_INFO, VIDEO_RES_SIZE_INFO
 
         assert self.resolution
         aspect_ratio: AspectRatio = self.aspect_ratio or "16,9"
@@ -487,6 +540,7 @@ class VisionDataOverrides(OverridesBase, _VisionDataBase):
 
 class SoundDataArgs(ArgsBase):
     enable_sound: bool = False
+    sound_path: ResolvedFilePath | None = None
 
 
 class SoundDataOverrides(OverridesBase):
@@ -494,8 +548,23 @@ class SoundDataOverrides(OverridesBase):
 
     enable_sound: Training[bool | None] = None
     """Enable joint video+sound generation (t2vs mode). Requires a checkpoint with sound modules."""
+    sound_path: ResolvedFilePathOrUrl | None = None
+    """Path or URL to a conditioning audio clip (e.g. .wav/.mp3/.flac). Required for
+    audio_image2video; the clip is encoded by the AVAE and used as a clean condition."""
+
+    @override
+    def download(self, output_dir: Path):
+        super().download(output_dir)
+        self.sound_path = download_file(self.sound_path, output_dir, "sound")
 
     def _build_sound_data(self, model_config: "OmniMoTModelConfig", sample_meta: SampleMeta):
+        if sample_meta.model_mode.is_sound_condition:
+            if self.sound_path is None:
+                raise ValueError(
+                    f"model_mode={sample_meta.model_mode.value} requires a `sound_path` "
+                    "(a conditioning audio clip)"
+                )
+            self.enable_sound = True
         if self.enable_sound is None:
             self.enable_sound = False
         if self.enable_sound and not model_config.sound_gen:
@@ -557,7 +626,7 @@ class ActionDataOverrides(OverridesBase):
             case ModelMode.FORWARD_DYNAMICS:
                 if self.action_path is None:
                     raise ValueError(f"'action_path' is required for model_mode={mode.value!r}")
-            case ModelMode.INVERSE_DYNAMICS | ModelMode.POLICY:
+            case ModelMode.INVERSE_DYNAMICS | ModelMode.WAM:
                 pass
             case _:
                 assert_never(mode)
@@ -569,6 +638,35 @@ class ActionDataOverrides(OverridesBase):
 _ReasonerTemperature = Annotated[float, pydantic.Field(gt=0, le=100)]
 _ReasonerTopP = Annotated[float, pydantic.Field(gt=0, le=1)]
 _ReasonerRepetitionPenalty = Annotated[float, pydantic.Field(gt=0)]
+
+
+def _mapping_get(node: Any, key: str) -> Any:
+    """``.get`` that tolerates None and non-mapping nodes (dict / DictConfig / LazyDict)."""
+    getter = getattr(node, "get", None)
+    return getter(key) if callable(getter) else None
+
+
+def _reasoner_vision_capable(model_config: "OmniMoTModelConfig") -> bool:
+    """Whether the checkpoint's reasoner LM can encode image/video prompts.
+
+    Qwen-family reasoners carry the ViT inside the checkpoint, gated by
+    ``include_visual``; a falsy value (e.g. an old ``--no-vit`` export, or a
+    text-only LLM backbone) means the tower was never built, so a vision
+    prompt would only fail mid-batch at the ``hasattr(causal_lm, "visual")``
+    gate. Edge's Nemotron reasoner sets ``include_visual=None`` by design and
+    loads its SigLIP2 tower lazily (``_ensure_vision_tower``), so it is always
+    vision-capable. Unknown families are treated as capable (never block).
+    """
+    vlm_config = model_config.vlm_config
+    model_instance = getattr(vlm_config, "model_instance", None)
+    target = str(_mapping_get(model_instance, "_target_") or "")
+    model_name = getattr(vlm_config, "model_name", "") or ""
+    if "Nemotron3DenseVLTextForCausalLM" in target or "Cosmos3-Edge" in model_name:
+        return True
+    if "Qwen" not in target and not model_name.startswith("Qwen/"):
+        return True
+    include_visual = _mapping_get(_mapping_get(model_instance, "config"), "include_visual")
+    return bool(include_visual)
 
 
 class ReasonerDataArgs(ArgsBase):
@@ -583,11 +681,12 @@ class ReasonerDataArgs(ArgsBase):
     top_p: _ReasonerTopP | None = None
     repetition_penalty: _ReasonerRepetitionPenalty | None = None
     presence_penalty: float | None = None
+    video_fps: pydantic.PositiveFloat | None = None
 
 
 class ReasonerDataOverrides(OverridesBase):
     """Reasoner overrides for ``model_mode='reasoner'``. ``vision_path`` (if set) is
-    used as the conditioning image; the VLM processor handles preprocessing."""
+    used as the conditioning image or video; the VLM processor handles preprocessing."""
 
     max_new_tokens: pydantic.PositiveInt | None = None
     """Maximum number of new tokens to generate per prompt."""
@@ -603,6 +702,8 @@ class ReasonerDataOverrides(OverridesBase):
     """CTRL/HF-style multiplicative repetition penalty (>0). ``1.0`` is identity."""
     presence_penalty: float | None = None
     """Additive presence penalty (any sign). ``0.0`` is identity."""
+    video_fps: pydantic.PositiveFloat | None = None
+    """Frames per second to sample from a video vision_path. None -> decoder default (2.0)."""
 
     def _build_reasoner_data(self, model_config: "OmniMoTModelConfig", sample_meta: SampleMeta):
         if not sample_meta.model_mode.is_reasoner:
@@ -610,6 +711,185 @@ class ReasonerDataOverrides(OverridesBase):
         self = cast("SampleDataOverrides", self)
         if not self.prompt.strip():
             raise ValueError("Reasoner inference requires a non-empty 'prompt'.")
+        if self.vision_path is not None and not _reasoner_vision_capable(model_config):
+            raise ValueError(
+                f"Reasoner sample {getattr(self, 'name', None)!r} conditions on vision input "
+                f"'{self.vision_path}', but the loaded checkpoint's reasoner LM has no visual tower "
+                "(model config include_visual is false — e.g. a --no-vit export or a text-only LLM "
+                "backbone). Use a text-only prompt, or re-export the checkpoint with the default "
+                "--vit / use a full checkpoint for image/video reasoner prompts."
+            )
+
+
+class _TransferDataBase:
+    @property
+    def transfer_hints(self) -> dict[TransferHintKey, TransferOverrides | TransferArgs]:
+        # Iteration order is `TransferHintKey` enum order, not JSON-key order — keep this
+        # deterministic so the model sees a stable [ctrl_1, ..., ctrl_N] sequence.
+        return {key: getattr(self, key.value) for key in TransferHintKey if getattr(self, key.value) is not None}
+
+
+class TransferDataArgs(ArgsBase, _TransferDataBase):
+    control_guidance: ControlGuidance = 1.0
+    control_guidance_interval: GuidanceInterval | None = None
+    edge: EdgeTransferArgs | None = None
+    blur: BlurTransferArgs | None = None
+    depth: TransferArgs | None = None
+    seg: TransferArgs | None = None
+    wsm: TransferArgs | None = None
+    negative_prompt_file: str | None = None
+    """JSON negative caption file for transfer specs (absolute path or filename under ``defaults/``)."""
+    num_video_frames_per_chunk: pydantic.PositiveInt | None = None
+    num_conditional_frames: pydantic.NonNegativeInt | None = None
+    max_frames: pydantic.PositiveInt | None = None
+    show_control_condition: bool | None = None
+    show_input: bool | None = None
+    num_first_chunk_conditional_frames: pydantic.NonNegativeInt | None = None
+    share_vision_temporal_positions: bool | None = None
+    emphasize_control_in_prompt: bool | None = None
+
+
+class TransferDataOverrides(OverridesBase, _TransferDataBase):
+    """Transfer inference overrides — activated when at least one control hint is set."""
+
+    control_guidance: Training[ControlGuidance | None] = None
+    """Control-CFG scale for transfer. The control map stays in the main forward; 1.0 disables
+    the extra comparison forward that drops control-map vision items. Values > 1.0 blend
+    velocities from with-maps vs without-maps forwards on the generated clip."""
+    control_guidance_interval: Training[GuidanceInterval | None] = None
+    """Timestep interval [lo, hi] (0–1000) in which control-CFG is applied; None applies
+    on every step."""
+    edge: EdgeTransferOverrides | None = None
+    """Edge (Canny) control-hint overrides; set to activate the edge transfer hint."""
+    blur: BlurTransferOverrides | None = None
+    """Blur control-hint overrides; set to activate the blur transfer hint."""
+    depth: TransferOverrides | None = None
+    """Depth control-hint overrides; set to activate the depth transfer hint."""
+    seg: TransferOverrides | None = None
+    """Segmentation control-hint overrides; set to activate the segmentation transfer hint."""
+    wsm: TransferOverrides | None = None
+    """World-surface-map (WSM) control-hint overrides; set to activate the WSM transfer hint."""
+    negative_prompt_file: str | None = None
+    """JSON negative caption file for transfer specs (absolute path or filename under ``defaults/``)."""
+    num_video_frames_per_chunk: pydantic.PositiveInt | None = None
+    """Number of video frames generated per autoregressive chunk."""
+    num_conditional_frames: pydantic.NonNegativeInt | None = None
+    """Number of conditioning frames carried into each generated chunk."""
+    max_frames: pydantic.PositiveInt | None = None
+    """Maximum number of frames to generate across all chunks."""
+    show_control_condition: bool | None = None
+    """If set, include the control condition (hint map) in the saved output."""
+    show_input: bool | None = None
+    """If set, include the input video alongside the generated output."""
+    num_first_chunk_conditional_frames: pydantic.NonNegativeInt | None = None
+    """Number of conditioning frames for the first chunk (defaults to ``num_conditional_frames``)."""
+    share_vision_temporal_positions: bool | None = None
+    """Share vision temporal position ids across autoregressive chunks."""
+    emphasize_control_in_prompt: bool | None = None
+    """If True (default), auto-append a one-sentence directive to the user prompt that
+    names the active control modality (e.g. "Follow the edge control video precisely.
+    ..."). Set False for clean baselines / ablations. The system prompt is unchanged."""
+
+    @pydantic.model_validator(mode="after")
+    def _validate_transfer_hints(self) -> Self:
+        hint_field_names = {k.value for k in TransferHintKey}
+        # ``control_guidance`` is concretized to its no-op default (1.0) by
+        # ``_build_transfer_data`` for *every* sample, transfer or not, so the
+        # default value must round-trip without a hint. Only an *explicit*
+        # non-default ``control_guidance`` signals an intended-but-incomplete
+        # transfer config, so it is checked separately below.
+        exempt = hint_field_names | {"control_guidance"}
+        transfer_only = [
+            name
+            for name in TransferDataOverrides.__annotations__
+            if name in type(self).model_fields and name not in exempt
+        ]
+        configured = any(getattr(self, f) is not None for f in transfer_only)
+        cg = self.control_guidance
+        cg_configured = cg is not None and cg != 1.0
+        if (configured or cg_configured) and not self.transfer_hints:
+            raise ValueError(
+                f"transfer inference requires at least one control hint ({', '.join(k.value for k in TransferHintKey)})"
+            )
+        return self
+
+    @override
+    def download(self, output_dir: Path):
+        super().download(output_dir)
+        for config in self.transfer_hints.values():
+            assert isinstance(config, TransferOverrides)
+            config.download(output_dir)
+
+    _TRANSFER_SAMPLE_DEFAULTS: ClassVar[dict[str, Any]] = {
+        "num_video_frames_per_chunk": 93,
+        "num_conditional_frames": 1,
+        "max_frames": 5000,
+        "show_control_condition": False,
+        "show_input": False,
+        "num_first_chunk_conditional_frames": 0,
+        "share_vision_temporal_positions": True,
+        "emphasize_control_in_prompt": True,
+    }
+    _TRANSFER_HINT_DEFAULTS: ClassVar[dict[TransferHintKey, dict[str, Any]]] = {
+        TransferHintKey.EDGE: {"preset_edge_threshold": PresetEdgeThreshold.MEDIUM},
+        TransferHintKey.BLUR: {"preset_blur_strength": PresetBlurStrength.MEDIUM},
+    }
+    # Tuned guidance / control_guidance per transfer task. Applied when the input JSON omits
+    # these fields (generic video2video sampling defaults otherwise apply).
+    _TRANSFER_DEFAULTS: ClassVar[dict[TransferHintKey, dict[str, Any]]] = {
+        TransferHintKey.EDGE: {"guidance": 3.0, "control_guidance": 1.5, "shift": 10.0},
+        TransferHintKey.BLUR: {"guidance": 3.0, "control_guidance": 1.5, "shift": 10.0},
+        TransferHintKey.DEPTH: {"guidance": 3.0, "control_guidance": 1.5, "shift": 10.0},
+        TransferHintKey.SEG: {"guidance": 3.0, "control_guidance": 2.0, "shift": 10.0},
+        TransferHintKey.WSM: {
+            "guidance": 1.0,
+            "control_guidance": 3.0,
+            "shift": 10.0,
+            "num_frames": 101,
+            "fps": 10,
+            "num_video_frames_per_chunk": 101,
+        },
+    }
+
+    def _build_transfer_data(
+        self,
+        model_config: "OmniMoTModelConfig",
+        sample_meta: SampleMeta,
+        *,
+        user_fields: frozenset[str] | None = None,
+    ):
+        self = cast("SampleDataOverrides", self)
+        # ``control_guidance`` is a required float in ``TransferDataArgs``.
+        # Keep it concrete even for non-transfer samples so ``OmniSampleArgs``
+        # validation never sees ``None``.
+        if self.control_guidance is None:
+            self.control_guidance = 1.0
+        hints = self.transfer_hints
+        if not hints:
+            return
+
+        if self.negative_prompt is None and self.negative_prompt_file is not None:
+            self.negative_prompt = _load_transfer_negative_prompt_file(self.negative_prompt_file)
+
+        for field, default in self._TRANSFER_SAMPLE_DEFAULTS.items():
+            if getattr(self, field) is None:
+                setattr(self, field, default)
+
+        for hint_key, config in hints.items():
+            for field, default in self._TRANSFER_HINT_DEFAULTS.get(hint_key, {}).items():
+                if getattr(config, field) is None:
+                    setattr(config, field, default)
+
+            if self.vision_path is None and config.control_path is None:
+                raise ValueError(
+                    f"transfer inference requires 'vision_path' or a pre-computed 'control_path' (hint: {hint_key})"
+                )
+
+        if len(hints) == 1:
+            hint_key = next(iter(hints))
+            for field, value in self._TRANSFER_DEFAULTS[hint_key].items():
+                if user_fields is None or field not in user_fields:
+                    setattr(self, field, value)
 
 
 class _SampleDataBase:
@@ -641,6 +921,7 @@ class SampleDataArgs(
     SoundDataArgs,
     ActionDataArgs,
     ReasonerDataArgs,
+    TransferDataArgs,
 ):
     model_mode: ModelMode
 
@@ -652,6 +933,7 @@ class SampleDataOverrides(
     SoundDataOverrides,
     ActionDataOverrides,
     ReasonerDataOverrides,
+    TransferDataOverrides,
 ):
     """Sample data arguments for 'OmniMoTModel.generate_samples'."""
 
@@ -765,9 +1047,22 @@ class OmniSampleOverrides(
         "Qwen/Qwen3-VL-32B-Instruct": "32B",
         "Qwen/Qwen3-VL-30B-A3B-Instruct": "30B-A3B",
         "Qwen/Qwen3-VL-235B-A22B-Instruct": "235B-A22B",
+        "nvidia/Cosmos3-Edge-Reasoner": "2B",
+    }
+
+    _NUM_FRAMES_DEFAULTS: ClassVar[dict[str, int]] = {
+        # Cosmos3-Edge defaults to a shorter 121-frame clip for video
+        # generation; every other model keeps the per-modality JSON default
+        # (189). Keyed by ``vlm_config.model_name`` so only Edge is affected.
+        "nvidia/Cosmos3-Edge-Reasoner": 121,
     }
 
     _RESOLUTION_SHIFT_DEFAULTS: ClassVar[dict[(ModelSize, Resolution), float]] = {
+        # 2B rows mirror Cosmos3-Edge's training shift (Cosmos3-Edge.yaml
+        # rectified_flow_training_config.shift: 256->3, 480->5, 720->10).
+        ("2B", "256"): 3.0,
+        ("2B", "480"): 5.0,
+        ("2B", "720"): 10.0,
         ("8B", "256"): 3.0,
         ("8B", "480"): 5.0,
         ("8B", "720"): 10.0,
@@ -791,12 +1086,28 @@ class OmniSampleOverrides(
             defaults = _load_modality_defaults(sample_meta.model_mode)
         overrides = self.model_dump(exclude_none=True)
         shift_configured = "shift" in overrides or defaults.get("shift") is not None
+        user_fields = frozenset(overrides)
         merged_data = _deep_merge(defaults, overrides)
         merged_data = {k: v for k, v in merged_data.items() if k in type(self).model_fields}
         merged = type(self).model_validate(merged_data)
 
         self.__dict__.update(merged.__dict__)
         self.model_mode = sample_meta.model_mode
+
+        # Model-specific num_frames default for video generation (e.g.
+        # Cosmos3-Edge -> 121). Applies only when the user did not request a
+        # frame count and the mode produces a plain video; image, action, and
+        # reasoner modes keep their own num_frames handling (reasoner reports
+        # VIDEO vision_mode but uses num_frames as an inert 1).
+        if (
+            "num_frames" not in user_fields
+            and sample_meta.vision_mode == VisionMode.VIDEO
+            and not sample_meta.model_mode.is_action
+            and not sample_meta.model_mode.is_reasoner
+        ):
+            num_frames_default = self._NUM_FRAMES_DEFAULTS.get(model_config.vlm_config.model_name)
+            if num_frames_default is not None:
+                self.num_frames = num_frames_default
 
         self._build_sample()
         self._build_sampling(model_config=model_config, sample_meta=sample_meta)
@@ -811,8 +1122,14 @@ class OmniSampleOverrides(
 
         self._build_reasoner_data(model_config=model_config, sample_meta=sample_meta)
 
+        self._build_transfer_data(
+            model_config=model_config, sample_meta=sample_meta, user_fields=user_fields
+        )
+
         if not shift_configured and not sample_meta.model_mode.is_reasoner:
-            model_size = self._VLM_MODEL_SIZE[model_config.vlm_config.model_name]
+            # Unregistered backbone names (custom fine-tunes) simply skip shift
+            # defaulting rather than KeyError-ing.
+            model_size = self._VLM_MODEL_SIZE.get(model_config.vlm_config.model_name)
             key = (model_size, self.resolution)
             if key in self._RESOLUTION_SHIFT_DEFAULTS:
                 self.shift = self._RESOLUTION_SHIFT_DEFAULTS[key]
@@ -860,6 +1177,15 @@ _CHECKPOINTS: dict[str, CheckpointConfig] = {
             revision="main",
         ),
     ),
+    "Cosmos3-Edge": CheckpointConfig(
+        model_memory_bytes=MODEL_MEMORY_BYTES_BY_SIZE["2B"],
+        config_file=str(CONFIG_DIR / "model/Cosmos3-Edge.yaml"),
+        s3_uri="s3://bucket1/cosmos3_vfm/cosmos3_ga_midtraining/cosmos3_ga_4bm2b_v1_midtrain_0630a/checkpoints/iter_000028000/",
+        hf=CheckpointDirHf(
+            repository="nvidia/Cosmos3-Edge",
+            revision="main",
+        ),
+    ),
     "Cosmos3-Super": CheckpointConfig(
         model_memory_bytes=MODEL_MEMORY_BYTES_BY_SIZE["32B"],
         config_file=str(CONFIG_DIR / "model/Cosmos3-Super.yaml"),
@@ -895,6 +1221,47 @@ _CHECKPOINTS: dict[str, CheckpointConfig] = {
         # Self-contained checkpoint: use its bundled processor instead of
         # downloading the base Cosmos3-Super repo just for the tokenizer.
         vlm_processor_from_checkpoint=True,
+    ),
+    "Cosmos3-Super-Text2Image-4Step": CheckpointConfig(
+        model_memory_bytes=MODEL_MEMORY_BYTES_BY_SIZE["32B"],
+        config_file=str(CONFIG_DIR / "model/Cosmos3-Super.yaml"),
+        s3_uri="s3://bucket1/cosmos3_vfm/cosmos3_ga_text2image_4step/",
+        hf=CheckpointDirHf(
+            repository="nvidia/Cosmos3-Super-Text2Image-4Step",
+            revision="main",
+        ),
+        experiment_overrides=(
+            "model.config.resolution='768'",
+            "model.config.action_gen=false",
+            "model.config.sound_gen=false",
+            "model.config.sound_dim=null",
+            "model.config.sound_tokenizer=null",
+            "model.config.rectified_flow_training_config.shift.720=5",
+            "model.config.rectified_flow_training_config.shift.768=5",
+            "model.config.tokenizer.encode_chunk_frames.768=8",
+            "model.config.tokenizer.encode_exact_durations=null",
+            "model.config.fixed_step_sampler_config.t_list=[1.0,0.9375,0.8333333333333334,0.625]",
+            "model.config.fixed_step_sampler_config.sample_type=sde",
+        ),
+    ),
+    "Cosmos3-Super-Image2Video-4Step": CheckpointConfig(
+        model_memory_bytes=MODEL_MEMORY_BYTES_BY_SIZE["32B"],
+        config_file=str(CONFIG_DIR / "model/Cosmos3-Super.yaml"),
+        s3_uri="s3://bucket1/cosmos3_vfm/cosmos3_ga_image2video_4step/",
+        hf=CheckpointDirHf(
+            repository="nvidia/Cosmos3-Super-Image2Video-4Step",
+            revision="main",
+        ),
+        experiment_overrides=(
+            "model.config.resolution='480'",
+            "model.config.action_gen=false",
+            "model.config.sound_gen=false",
+            "model.config.sound_dim=null",
+            "model.config.sound_tokenizer=null",
+            "model.config.diffusion_expert_config.base_fps=16",
+            "model.config.fixed_step_sampler_config.t_list=[1.0,0.9375,0.8333333333333334,0.625]",
+            "model.config.fixed_step_sampler_config.sample_type=sde",
+        ),
     ),
 }
 DEFAULT_CHECKPOINT_NAME = "Cosmos3-Nano"
@@ -1046,8 +1413,29 @@ def _get_dp_shard_size(
 
 @cache
 def _get_device_memory_bytes() -> int:
-    pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-    info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-    pynvml.nvmlShutdown()
-    return info.total
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        info = _get_nvml_device_memory_info(handle)
+        return info.total
+    except Exception:
+        # Fallback for unified memory architectures (e.g., GB10) where
+        # nvmlDeviceGetMemoryInfo is not supported.
+        import torch
+        if torch.cuda.is_available():
+            return int(torch.cuda.get_device_properties(0).total_memory)
+        return 128 * 1024**3  # Default 128GB
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
+def _get_nvml_device_memory_info(handle: Any) -> Any:
+    try:
+        return pynvml.nvmlDeviceGetMemoryInfo_v2(handle)
+    except AttributeError:
+        return pynvml.nvmlDeviceGetMemoryInfo(handle)
+    except pynvml.NVMLError_NotSupported:
+        return pynvml.nvmlDeviceGetMemoryInfo(handle)

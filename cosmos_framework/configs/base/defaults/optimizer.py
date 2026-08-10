@@ -5,10 +5,25 @@
 
 from typing import Any
 
+import torch
+from packaging.version import InvalidVersion, Version
+
 from cosmos_framework.utils.lazy_config import PLACEHOLDER
 from cosmos_framework.utils.lazy_config import LazyCall as L
 from cosmos_framework.utils.config_helper import ConfigStore
-from cosmos_framework.utils.vfm.optimizer import build_lr_scheduler, build_optimizer
+from cosmos_framework.utils.generator.optimizer import build_lr_scheduler, build_optimizer
+
+
+def _supports_dion2_compile_batched_pre_ns(torch_version: str) -> bool:
+    """Return whether a Torch release supports compiled batched Dion2 pre-NS updates."""
+    try:
+        release = Version(torch_version).release
+    except InvalidVersion:
+        return False
+    # Compare release components so 2.13 prereleases, including NVIDIA alpha builds,
+    # are enabled without treating them as older than the final 2.13.0 release.
+    return release[:2] >= (2, 13)
+
 
 OPTIMIZER_KWARGS: dict[str, Any] = dict(
     # Learning rate for the optimizer.
@@ -29,6 +44,64 @@ OPTIMIZER_KWARGS: dict[str, Any] = dict(
     # Whether to disable weight decay for one-dimensional params such as norm weights and biases.
     # Default is False to preserve historical optimizer behavior.
     disable_weight_decay_for_1d_params=False,
+)
+
+# Muon / Dion2 share the standard factory knobs (keys_to_select, lr_multipliers,
+# disable_weight_decay_for_1d_params) plus their own orthogonalization
+# hyperparameters. ``fused`` is required by the factory; the AdamW side is fused
+# by construction and ``capturable`` / ``master_weights`` are forced on.
+MUON_OPTIMIZER_KWARGS: dict[str, Any] = dict(
+    # Base learning rate. Muon scales matrix params by muon_lr_scale*sqrt(max(A,B));
+    # the AdamW side and the per-param-group lr_multipliers use it directly.
+    lr=1e-4,
+    weight_decay=0.1,
+    adam_betas=[0.9, 0.99],
+    eps=1e-8,
+    fused=True,
+    keys_to_select=[],
+    lr_multipliers={},
+    disable_weight_decay_for_1d_params=False,
+    # Name substrings for stacked MoE expert params ([E, M, N]) to orthogonalize
+    # per expert slice. Empty = experts stay on AdamW (no behavior change).
+    # e.g. ["gate_up_proj", "down_proj"] for grouped-MM MoE experts.
+    expert_param_keywords=[],
+    # Muon-specific.
+    muon_momentum=0.95,
+    muon_lr_scale=0.2,
+    ns_steps=5,
+    nesterov=True,
+    use_distributed=True,
+)
+
+DION2_OPTIMIZER_KWARGS: dict[str, Any] = dict(
+    lr=1e-4,
+    weight_decay=0.1,
+    adam_betas=[0.9, 0.99],
+    eps=1e-8,
+    fused=True,
+    keys_to_select=[],
+    lr_multipliers={},
+    disable_weight_decay_for_1d_params=False,
+    # Name substrings for stacked MoE expert params ([E, M, N]) to orthogonalize
+    # per expert slice. Empty = experts stay on AdamW (no behavior change).
+    # e.g. ["gate_up_proj", "down_proj"] for grouped-MM MoE experts.
+    expert_param_keywords=[],
+    # Muon/Dion2-specific.
+    muon_momentum=0.95,
+    muon_lr_scale=0.2,
+    ns_steps=5,
+    nesterov=True,
+    use_distributed=True,
+    # Dion2-specific: submatrix selection fraction and error-feedback decay.
+    fraction=1.0,
+    ef_decay=0.95,
+    # Maximum same-shape matrix count processed per rank in one redistribution.
+    # Each shape group independently uses the smaller of this cap and ceil(group_size / FSDP size).
+    max_dion2_megabatch_width=25,
+    # Compile all active same-shape pre-NS momentum updates on supported Torch releases.
+    dion2_compile_batched_pre_ns=_supports_dion2_compile_batched_pre_ns(torch.__version__),
+    # Opt-in Torch/NVTX annotations for forward/NS/reverse/apply phases.
+    dion2_profile_phases=False,
 )
 
 LAMBDACOSINE_KWARGS: dict[str, Any] = dict(
@@ -64,6 +137,26 @@ def register_optimizers(optimizer_kwargs: dict[str, Any]) -> None:
             **optimizer_kwargs,
         ),
     )
+    cs.store(
+        group="optimizer",
+        package="optimizer",
+        name="muonwithauxadamw",
+        node=L(build_optimizer)(
+            model=PLACEHOLDER,
+            optimizer_type="MuonWithAuxAdamW",
+            **MUON_OPTIMIZER_KWARGS,
+        ),
+    )
+    cs.store(
+        group="optimizer",
+        package="optimizer",
+        name="dion2withauxadamw",
+        node=L(build_optimizer)(
+            model=PLACEHOLDER,
+            optimizer_type="Dion2WithAuxAdamW",
+            **DION2_OPTIMIZER_KWARGS,
+        ),
+    )
 
 
 def register_schedulers(lambdacosine_kwargs: dict[str, Any]) -> None:
@@ -91,6 +184,23 @@ def register_schedulers(lambdacosine_kwargs: dict[str, Any]) -> None:
             optimizer=PLACEHOLDER,
             lr_scheduler_type="LambdaCosine",
             **lambdacosine_kwargs,
+        ),
+    )
+    # WSD (Warmup-Stable-Decay) scheduler for LLM pretraining
+    cs.store(
+        group="scheduler",
+        package="scheduler",
+        name="wsd",
+        node=L(build_lr_scheduler)(
+            optimizer=PLACEHOLDER,
+            lr_scheduler_type="wsd",
+            warm_up_steps=2000,
+            total_steps=50000,
+            decay_steps=5000,
+            decay_type="cosine",
+            f_start=0.01,
+            f_max=1.0,
+            f_min=0.1,
         ),
     )
 

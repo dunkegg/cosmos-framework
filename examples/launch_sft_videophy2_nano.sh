@@ -3,15 +3,15 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 
 # Structured-TOML launch for videophy2_sft_nano (VLM dialog SFT on VideoPhy-2
-# via DataPackerDataLoader). Drives cosmos_framework.scripts.train against
+# via CosmosDataLoader). Drives cosmos_framework.scripts.train against
 # examples/toml/sft_config/videophy2_sft_nano.toml.
 #
-# [job].task = "vlm" — picks cosmos_framework/configs/base/vlm/config.py as the base config.
+# [job].task = "vlm" — picks cosmos_framework/configs/base/reasoner/config.py as the base config.
 #
 # Required env:
 #   VIDEOPHYSICS_ROOT  dir containing videophy2_train/ and videophy2_val/
 #                      (each with meta.json + media/ + text/). Populate via
-#                      `python -m cosmos_framework.scripts.vlm.prepare_videophy2_from_hf`.
+#                      `python -m cosmos_framework.scripts.reasoner.prepare_videophy2_from_hf`.
 #
 # Optional env:
 #   HF_TOKEN               for gated Qwen3-VL-8B-Instruct downloads.

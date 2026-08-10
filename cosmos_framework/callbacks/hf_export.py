@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
+
 """HFExportCallback: export VLM DCP checkpoints to HuggingFace safetensors format.
 
 Design notes
@@ -132,16 +133,16 @@ class HFExportCallback(Callback):
             return
 
         # Deferred import to avoid circular dependency at module load time.
-        from cosmos_framework.model.vfm.vlm_model import VLMModel
+        from cosmos_framework.model.generator.vlm_model import VLMModel
 
         if not isinstance(model, VLMModel):
             # The legacy vlm/train.py path passes model_parts: list[nn.Module] (raw HF
             # models without the VLMModel attribute structure).  HF export requires the
-            # VLMModel wrapper, which is only available via the unified cosmos_framework/scripts/train.py path.
+            # VLMModel wrapper, which is only available via the unified scripts/train.py path.
             if isinstance(model, list):
                 log.warning(
                     "[HFExportCallback] Received model_parts (list) instead of VLMModel. "
-                    "HF export requires the unified training path (cosmos_framework/scripts/train.py). Skipping."
+                    "HF export requires the unified training path (scripts/train.py). Skipping."
                 )
             else:
                 log.warning(
@@ -355,6 +356,9 @@ class HFExportCallback(Callback):
         #    hf_config.save_pretrained) are never overwritten.
         #    HARD failure: a broken copy leaves the checkpoint unloadable, so any I/O error
         #    propagates to the background-worker wrapper (same as shard writes).
+        #    Native-format snapshots (e.g. nvidia/Cosmos3-Edge, model_type
+        #    "cosmos3_edge") ship no remote-code .py files — nothing to copy is
+        #    normal; the export loads through the framework-registered classes.
         if model_name_or_path and os.path.isdir(model_name_or_path):
             real_src = os.path.realpath(model_name_or_path)
             real_out = os.path.realpath(output_dir)
@@ -388,6 +392,11 @@ class HFExportCallback(Callback):
                         copied.append(os.path.join(rel_dir, fname) if rel_dir != "." else fname)
             if copied:
                 log.info(f"[HFExportCallback] Copied missing files from source model: {copied}")
+            else:
+                log.info(
+                    "[HFExportCallback] No missing .py/.json files to copy from source model "
+                    "(expected for native-format snapshots, which ship no remote code)."
+                )
 
         # 5. Tokenizer (best-effort — may fail for custom / gated models).
         if AutoTokenizer is not None and model_name_or_path:

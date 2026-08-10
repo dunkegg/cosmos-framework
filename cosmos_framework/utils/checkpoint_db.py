@@ -65,7 +65,7 @@ from typing_extensions import Self, override
 from cosmos_framework.utils.flags import EXPERIMENTAL_CHECKPOINTS, INTERNAL, StrEnum
 from cosmos_framework.utils import log
 
-HF_VERSION = "1.16.4"
+_HF_CLI_PROJECT = Path(__file__).resolve().with_name("hf_cli")
 
 
 def _is_uuid(checkpoint_uri: str) -> bool:
@@ -142,13 +142,19 @@ CheckpointS3: TypeAlias = CheckpointFileS3 | CheckpointDirS3
 def _hf_download(cmd_args: list[str]) -> str:
     """Run Hugging Face CLI download command and return the local path.
 
-    Uses a newer Hugging Face CLI version to download checkpoint. The dependency
-    version is very old and not robust.
+    Uses a separately locked Hugging Face CLI because the dependency in the
+    application environment is too old and not robust.
     """
     is_rank0 = os.environ.get("RANK", "0") == "0"
     cmd = [
-        "uvx",
-        f"hf@{HF_VERSION}",
+        "uv",
+        "run",
+        "--isolated",
+        "--project",
+        str(_HF_CLI_PROJECT),
+        "--locked",
+        "--no-default-groups",
+        "hf",
         "download",
         "--format=json",
         *cmd_args,
@@ -291,7 +297,6 @@ class CheckpointConfig(pydantic.BaseModel):
     """Config for checkpoint on S3."""
     hf: CheckpointHf
     """Config for checkpoint on Hugging Face."""
-
     post_download: Callable[[str], None] | None = pydantic.Field(default=None, exclude=True)
     """Optional callback invoked with the local path after a successful download.
 
@@ -424,6 +429,11 @@ def download_checkpoint(checkpoint_uri: str, *, check_exists: bool = True) -> st
     - HuggingFace URI: hf://org/repo/path/to/file.pth
     - Local path: /path/to/checkpoint
     """
+    # Local-path short-circuit: if the URI exists on disk, return it as-is
+    # without consulting the registry. Prevents the registry from rewriting
+    # a known basename (e.g. Wan2.2_VAE.pth) into an s3:// URI we can't open.
+    if os.path.exists(checkpoint_uri):
+        return checkpoint_uri
     if INTERNAL:
         return checkpoint_uri
     if (checkpoint := CheckpointConfig.maybe_from_uri(checkpoint_uri)) is not None:
@@ -441,11 +451,6 @@ def download_checkpoint_v2(checkpoint_uri: str, *, check_exists: bool = True) ->
 
     Similar to 'download_checkpoint', but unknown S3 URIs are passed through.
     """
-    # Local-path short-circuit: if the URI exists on disk, return it as-is
-    # without consulting the registry. Prevents the registry from rewriting
-    # a known basename (e.g. Wan2.2_VAE.pth) into an s3:// URI we can't open.
-    if os.path.exists(checkpoint_uri):
-        return checkpoint_uri
     if INTERNAL:
         return checkpoint_uri
     if (checkpoint := CheckpointConfig.maybe_from_uri(sanitize_uri(checkpoint_uri))) is not None:
@@ -454,6 +459,16 @@ def download_checkpoint_v2(checkpoint_uri: str, *, check_exists: bool = True) ->
         return checkpoint_uri
     if checkpoint_uri.startswith("hf://"):
         return _download_hf_checkpoint(checkpoint_uri)
+    # Bare relative registry path produced by Cosmos3-Edge-Policy-DROID. Its checkpoint
+    # conversion exports the Wan2.2 VAE tokenizer with an empty ``bucket_name`` (Nano
+    # exports ``bucket_name="bucket"``), so ``Wan2pt2VAEInterface`` forwards the raw relative
+    # ``vae_path`` ("pretrained/tokenizers/video/wan2pt2/Wan2.2_VAE.pth") here instead of the
+    # ``s3://bucket/...`` key. Re-form that key so it resolves through the registry and
+    # auto-downloads from HF, matching Nano's path. Local files still take precedence (below).
+    if "://" not in checkpoint_uri and not os.path.exists(checkpoint_uri):
+        registered = CheckpointConfig.maybe_from_uri(sanitize_uri(f"s3://bucket/{checkpoint_uri}"))
+        if registered is not None:
+            return registered.download()
     if check_exists and not os.path.exists(checkpoint_uri):
         raise ValueError(f"Checkpoint path {checkpoint_uri} does not exist.")
     return checkpoint_uri

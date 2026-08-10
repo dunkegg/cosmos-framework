@@ -13,13 +13,11 @@ import torch
 from cosmos_framework.inference.common.args import DEFAULT_CONFIG_FILE
 from cosmos_framework.inference.common.config import (
     _is_type_cls,
-    apply_config_replacements,
     config_converter,
     deserialize_config,
     load_config,
     serialize_config,
     structure_config,
-    undo_config_replacements,
     unstructure_config,
 )
 from cosmos_framework.utils.flags import TRAINING
@@ -113,6 +111,11 @@ def test_config_converter():
     assert structure_config(config_dict, Config) == structured_config
 
 
+def test_config_converter_handles_explicit_none_type() -> None:
+    assert config_converter.structure(None, type(None)) is None
+    with pytest.raises(TypeError, match="Expected None"):
+        config_converter.structure("not-none", type(None))
+
 
 if TRAINING:
 
@@ -123,10 +126,13 @@ if TRAINING:
         config_module = importlib.import_module(config_helper.get_config_module(config_file))
         config_module.make_config()
 
-    def test_serialize_config(tmp_path: Path):
+    def test_serialize_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        # vision_sft_nano interpolates the dataset location from ${oc.env:DATASET_PATH};
+        # serialization only needs the variable defined, not a real dataset on disk.
+        monkeypatch.setenv("DATASET_PATH", "/tmp/dataset")
         config = load_config(
             config_file="cosmos_framework/configs/base/config.py",
-            experiment="t2w_mot_dryrun_exp100_006_qwen3_0p6b_256res_resume_from_t2i",
+            experiment="vision_sft_nano",
         )
 
         for suffix in [".yaml", ".json"]:

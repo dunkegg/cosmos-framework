@@ -10,12 +10,11 @@ This module provides general-purpose utilities:
     - Temporal utilities: split_temporal_dimension, restore_original_shape,
       reconstruct_from_temporal_slices
 
-Note: Metrics like calculate_psnr have been moved to projects.cosmos3.tokenizer.evaluation.reconstruction_metrics
+Note: Metrics like calculate_psnr have been moved to cosmos_framework.model.tokenizer.evaluation.reconstruction_metrics
 """
 
 from __future__ import annotations
 
-import re
 from functools import lru_cache
 from typing import Any, Literal
 
@@ -204,18 +203,23 @@ def batch_tensor_to_sparse(batch_tensor: torch.Tensor, patch_size: tuple[int, in
     """Convert a batch tensor to SparseTensor.
 
     Args:
-        batch_tensor: Input tensor of shape [B, C, H, W] or [B, T, H, W, C].
+        batch_tensor: Input tensor of shape [B, C, H, W], [B, H, W, C], or [B, T, H, W, C].
         patch_size: Patch size (Pt, Ph, Pw).
 
     Returns:
         SparseTensor with patches as features.
     """
+    Pt, Ph, Pw = patch_size
     if batch_tensor.dim() == 4:
         if batch_tensor.shape[1] == 3:
-            batch_tensor = rearrange(batch_tensor, "b c h w -> b h w c")
-        batch_tensor = batch_tensor.unsqueeze(1)
+            batch_tensor = rearrange(batch_tensor, "b c h w -> b h w c")  # [B,H,W,C]
+        batch_tensor = batch_tensor.unsqueeze(1)  # [B,1,H,W,C]
+        if Pt > 1:
+            temporal_padding = batch_tensor.new_zeros(
+                (batch_tensor.shape[0], Pt - 1, *batch_tensor.shape[2:])
+            )  # [B,Pt-1,H,W,C]
+            batch_tensor = torch.cat((batch_tensor, temporal_padding), dim=1)  # [B,Pt,H,W,C]
     batch, T, H, W, _ = batch_tensor.shape
-    Pt, Ph, Pw = patch_size
     assert T % Pt == 0 and H % Ph == 0 and W % Pw == 0
     num_temporal_patches = T // Pt
     num_height_patches = H // Ph
@@ -331,9 +335,6 @@ def sparse_to_batched_tensor(
     channels: int = 3,
 ) -> torch.Tensor | None:
     """Convert a uniform SparseTensor batch to a dense `[B, T, C, H, W]` tensor."""
-    if re.search(r"3D", task_type):
-        return None
-
     Pt, Ph, Pw = patch_size
     full_patch_size = [Pt, Ph, Pw, channels]
     variable_factor = np.prod(full_patch_size) // sparse_tensor.feats.shape[1]
@@ -386,16 +387,12 @@ def sparse_to_img_list(
         sparse_tensor: Input SparseTensor to convert.
         patch_size: Tuple of (Pt, Ph, Pw) patch dimensions.
         var_patch_axis: Axis with variable patch size.
-        task_type: Type of task (e.g., "image", "video", "3D").
+        task_type: Type of task (e.g., "image", "video").
         channels: Number of channels.
 
     Returns:
         List of image tensors.
     """
-    # Check if this is a 3D batch (coords with different z index)
-    if re.search(r"3D", task_type):
-        return [sparse_tensor]
-
     Pt, Ph, Pw = patch_size
 
     # Select patch_size based on input
@@ -561,14 +558,14 @@ def resize_and_crop(
 # =============================================================================
 # Logging
 # =============================================================================
-# Note: calculate_psnr has been moved to projects.cosmos3.tokenizer.evaluation.reconstruction_metrics
+# Note: calculate_psnr has been moved to cosmos_framework.model.tokenizer.evaluation.reconstruction_metrics
 # =============================================================================
 
 
 class SampleLogger:
     """Logger for visualizing samples during training."""
 
-    def __init__(self, log_every_n: int = 10, max_samples: int = 1):
+    def __init__(self, log_every_n: int = 10, max_samples: int = 1) -> None:
         """Initialize sample logger.
 
         Args:

@@ -33,7 +33,7 @@ mkdir -p "$HF_HOME"
 echo ">>> $(date '+%H:%M:%S') HF_HOME=$HF_HOME STAGE_DIR=$STAGE_DIR REPO_ROOT=$REPO_ROOT"
 
 # ----------------------------------------------------------------------------
-# 0. Python env: uv sync + pinned transformers. cosmos_framework/utils/vfm/monkey_patch.py
+# 0. Python env: uv sync + pinned transformers. cosmos_framework/utils/generator/monkey_patch.py
 #    hard-rejects every transformers version except 4.57.1 (pyproject's
 #    `>=4.57.1,<5.0` is looser than what actually works at runtime).
 # ----------------------------------------------------------------------------
@@ -50,14 +50,19 @@ if [[ "$(python -c 'import transformers; print(transformers.__version__)')" != "
 fi
 echo ">>> $(date '+%H:%M:%S') transformers=$(python -c 'import transformers; print(transformers.__version__)')"
 
+# retry once with --refresh: `hf@latest` doesn't refresh dependency index metadata
+_hf_download() {
+    uvx hf@latest download "$@" --quiet \
+        || uvx --refresh hf@latest download "$@" --quiet
+}
+
 # ----------------------------------------------------------------------------
-# 1. Mixed-modality SFT dataset (bridge-v2-subset-synthetic-captions).
+# 1. Mixed-modality SFT dataset (BridgeData2-Subset-Synthetic-Captions).
 # ----------------------------------------------------------------------------
-echo ">>> $(date '+%H:%M:%S') downloading bridge-v2-subset-synthetic-captions ..."
-BRIDGE_ROOT=$(uvx hf@latest download --repo-type dataset \
-    nvidia/bridge-v2-subset-synthetic-captions \
-    --revision 46468e12ac0dd36901e9e3240d4fc7620942b5d7 \
-    --quiet)
+echo ">>> $(date '+%H:%M:%S') downloading BridgeData2-Subset-Synthetic-Captions ..."
+BRIDGE_ROOT=$(_hf_download --repo-type dataset \
+    nvidia/BridgeData2-Subset-Synthetic-Captions \
+    --revision 40d018ac1c1a2a4b9734f17fdb21f3d933c49a01)
 DATASET_PATH="$BRIDGE_ROOT/sft_dataset_bridge"
 echo "DATASET_PATH=$DATASET_PATH"
 
@@ -65,21 +70,20 @@ echo "DATASET_PATH=$DATASET_PATH"
 # 2. Wan2.2 VAE checkpoint.
 # ----------------------------------------------------------------------------
 echo ">>> $(date '+%H:%M:%S') downloading Wan2.2_VAE.pth ..."
-WAN_VAE_PATH=$(uvx hf@latest download Wan-AI/Wan2.2-TI2V-5B Wan2.2_VAE.pth --quiet)
+WAN_VAE_PATH=$(_hf_download Wan-AI/Wan2.2-TI2V-5B Wan2.2_VAE.pth)
 echo "WAN_VAE_PATH=$WAN_VAE_PATH"
 
 # ----------------------------------------------------------------------------
 # 3. VLM backbone for launch_vlm_llava_ov (Qwen3-VL-8B-Instruct). Cosmos's
 #    tokenizer dispatcher checks for the substring `Qwen/Qwen3-VL` in the path
-#    (cosmos_framework/data/vfm/processors/__init__.py); HF's cache uses
+#    (cosmos_framework/data/generator/processors/__init__.py); HF's cache uses
 #    `models--Qwen--Qwen3-VL-8B-Instruct/snapshots/...` which doesn't match. We
 #    add a `$STAGE_DIR/Qwen/Qwen3-VL-8B-Instruct` symlink so the dispatched
 #    substring is present, and point `MODEL_PATH` at the symlink.
 # ----------------------------------------------------------------------------
 echo ">>> $(date '+%H:%M:%S') downloading Qwen3-VL-8B-Instruct ..."
-_HF_SNAP=$(uvx hf@latest download Qwen/Qwen3-VL-8B-Instruct \
-    --revision 0c351dd01ed87e9c1b53cbc748cba10e6187ff3b \
-    --quiet)
+_HF_SNAP=$(_hf_download Qwen/Qwen3-VL-8B-Instruct \
+    --revision 0c351dd01ed87e9c1b53cbc748cba10e6187ff3b)
 mkdir -p "$STAGE_DIR/Qwen"
 ln -sfn "$_HF_SNAP" "$STAGE_DIR/Qwen/Qwen3-VL-8B-Instruct"
 MODEL_PATH="$STAGE_DIR/Qwen/Qwen3-VL-8B-Instruct"

@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
-
 from typing import Any
 
 import attrs
@@ -11,7 +10,7 @@ from cosmos_framework.configs.base.defaults.activation_checkpointing import Acti
 from cosmos_framework.configs.base.defaults.compile import CompileConfig
 from cosmos_framework.configs.base.defaults.ema import EMAConfig
 from cosmos_framework.configs.base.defaults.parallelism import ParallelismConfig
-from cosmos_framework.configs.base.defaults.vlm import VLMConfig
+from cosmos_framework.configs.base.defaults.reasoner import VLMConfig
 
 
 @attrs.define(slots=False)
@@ -25,23 +24,18 @@ class DiffusionExpertConfig:
     max_vae_latent_side_after_patchify: int = (
         20  # Max dimension (h or w) of the VAE latent after patchification (320/(8*2))
     )
-    # Position embedding type for vision tokens:
-    #   - "3d_rope": Additive 3D RoPE embeddings (VideoRopePosition3DEmb) + 1D position IDs for attention
-    #   - "flattened_sin_cos": Additive flattened sin/cos embeddings + 1D position IDs for attention
-    #   - "unified_3d_mrope": No additive embedding + 3D position IDs for Qwen3VL-style mRoPE attention
-    position_embedding_type: str = "3d_rope"
-    # When finetuning from lower resolution to higher resolution, the spatial resolution of videos increase.
-    # So, we need to adjust the position embedding.
-    # We use NTK based RoPE extrapolation to adjust the position embedding.
-    # Reference: (https://www.reddit.com/r/LocalLLaMA/comments/14lz7j5/ntkaware_scaled_rope_allows_llama_models_to_have/)
-    # Design adapted from Cosmos2.5 (https://arxiv.org/pdf/2511.00062)
-    # extrapolation_ratio here is how the base of the RoPE is scaled
-    # b' = b * extrapolation_ratio^(dim / (dim - 2))
-    rope_h_extrapolation_ratio: float = 1.0
-    rope_w_extrapolation_ratio: float = 1.0
-    rope_t_extrapolation_ratio: float = 1.0
+    # Vision/action/sound position information is always provided through
+    # Qwen3VL-style 3D mRoPE attention IDs.
     enable_fps_modulation: bool = False
     base_fps: int = 24
+    # Base temporal compression factor for SOUND m-RoPE. None = current behavior
+    # (sound advances at base_fps positions/sec). Set to the vision tcf (4) to put
+    # sound on the same latent-frame temporal grid as vision/action.
+    sound_base_temporal_compression_factor: int | None = None
+    # Temporal coordinates used for unified_3d_mrope vision tokens.
+    # - "latent_index": legacy behavior, positions are 0, 1, ..., T_latent-1.
+    # - "uniae_source_right_edge": use UniAE padded-patch right-edge source-frame coordinates.
+    vision_temporal_position_mode: str = "latent_index"
     # For unified_3d_mrope: whether spatial (H, W) indices reset to 0 for each vision segment
     unified_3d_mrope_reset_spatial_ids: bool = True
     # Setting the temporal gap on the boundary of the different modalities, default is 0, using a value greater than 0 will add an additional offset on the accumulated temporal offset.
@@ -74,10 +68,6 @@ class RectifiedFlowTrainingConfig:
     loss_scale: float = 1.0  # Loss scale
     image_loss_scale: float | None = None  # If set, overrides loss_scale for images
     sound_loss_scale: float | None = None  # If set, overrides loss_scale for sound
-    use_high_sigma_strategy: bool = False  # Whether to use high sigma strategy
-    high_sigma_ratio: float = 0.05  # Ratio of using high sigmas
-    high_sigma_timesteps_min: int = 995  # Minimum timestep for high sigma
-    high_sigma_timesteps_max: int = 1000  # Maximum timestep for high sigma
     use_discrete_rf: bool = False  # Whether to use discrete formulation of rectified flow
 
     # user: please adjust this value according to loss_scale to balance the action loss with the video loss.
@@ -86,21 +76,16 @@ class RectifiedFlowTrainingConfig:
 
     # Independent noise schedule for action. When False (default), action shares the sigma
     # sampled from the vision RF on every step — legacy behavior. When True, action samples
-    # its own sigma from `rectified_flow_action` using `shift_action` and
-    # `use_high_sigma_strategy_action`. Action always uses a shared scalar sigma per sample
-    # ([B,1]), independent of vision's DF mode. If action opts in to the high-sigma strategy,
-    # it reuses the global ratio / min / max.
+    # its own sigma from `rectified_flow_action` using `shift_action`. Action always uses a
+    # shared scalar sigma per sample ([B,1]), independent of vision's DF mode.
     independent_action_schedule: bool = False
     shift_action: int | None = None  # must be int; None → inherit `shift` (which must also be int)
-    use_high_sigma_strategy_action: bool = False
 
     # Independent noise schedule for sound. When False (default), sound shares the vision
     # sigma schedule, reindexed to the dense audio-bearing subset. When True, sound samples
-    # its own scalar sigma per sample ([B,1]) from `rectified_flow_sound` using `shift_sound`
-    # and `use_high_sigma_strategy_sound`.
+    # its own scalar sigma per sample ([B,1]) from `rectified_flow_sound` using `shift_sound`.
     independent_sound_schedule: bool = False
     shift_sound: int | None = None  # must be int; None → inherit `shift` (which must also be int)
-    use_high_sigma_strategy_sound: bool = False
 
     # When True, per-instance flow-matching loss is normalized by the count of
     # active (noisy) elements rather than all elements — preserves sum/active_count
@@ -110,6 +95,23 @@ class RectifiedFlowTrainingConfig:
     # (T-K)/T, which undertrains the attend-to-clean-history dynamics. Kept
     # False by default to preserve legacy loss magnitudes; enable for AR/DF training.
     normalize_loss_by_active: bool = False
+
+    # Sample-level (vs rank-level) loss averaging for the vision modality.
+    #
+    # By default the vision loss on each rank is a mean over that rank's samples, and
+    # FSDP/DDP averages gradients across ranks — so every *rank* contributes equally
+    # regardless of how many image/video samples it holds ("rank-level averaging").
+    # When ranks carry different sample counts this over-weights samples on sparse ranks.
+    #
+    # When True, the loss is renormalized so every *sample* contributes equally across
+    # the whole data-parallel group: each iteration all-reduces the total number of image
+    # and video samples over the DP group, and image and video losses are each normalized
+    # by their own global sample count and then summed. This counteracts the framework's
+    # rank-level gradient averaging so the effective objective is a true per-sample mean.
+    # The two independently normalized terms are weighted by the existing `image_loss_scale`
+    # (images; falls back to `loss_scale` when None) and `loss_scale` (videos), so their
+    # balance is tuned with the same knobs as the legacy rank-level path.
+    sample_level_loss_averaging: bool = False
 
 
 @attrs.define(slots=False)
@@ -133,8 +135,8 @@ class FixedStepSamplerConfig:
     # Convention: exclude the final 0.0 step — FixedStepSampler appends it automatically.
     # Values must be descending. Using 0.999 instead of 1.0 avoids numeric edge cases at sigma=1.
     t_list: list[float] = [0.999, 0.75, 0.5, 0.25]
-    # Integrator type: "ode" (deterministic Euler) or "sde" (stochastic re-noising at each step).
-    sample_type: str = "ode"
+    # Distilled fixed-step sampling uses stochastic re-noising at each step.
+    sample_type: str = "sde"
 
 
 # Don't have any defaults and init only in config file.
@@ -145,6 +147,11 @@ class OmniMoTModelConfig:
     """
 
     tokenizer: LazyDict = None
+    load_vision_tokenizer: bool = True
+    """Instantiate the vision tokenizer.
+
+    Reasoner-only inference disables this to avoid loading the generation VAE.
+    """
     net: LazyDict = None
     ema: EMAConfig = EMAConfig()
 
@@ -197,9 +204,7 @@ class OmniMoTModelConfig:
     # Attention implementation for joint understanding + generation
     # Note "two_way" and "three_way" disallow and remove "End-of-Vision" or other text token in the generation tower.
     # "three_way" must only be used when introducing sparsity
-    joint_attn_implementation: str = (
-        "two_way"  # "two_way", "three_way" or "flex" (NOTICE: We are planning to remove "flex" soon)
-    )
+    joint_attn_implementation: str = "two_way"  # "two_way" or "three_way"
 
     # Per-layer NATTEN parameters
     # Must use "three_way" attention if used.
@@ -272,4 +277,19 @@ class OmniMoTModelConfig:
     sound_dim: int | None = None  # Sound latent channel size (e.g., 64 for AVAE 48kHz)
     sound_latent_fps: int = 25  # Sound tokenizer's latent rate (e.g., 48kHz / 1920 hop = 25 Hz)
 
+    # When False, removes bias from vae2llm, sound2llm, and the two Linear layers inside
+    # time_embedder.  These biases seem to inject token-constant DC offsets that dominate
+    # the MoE router input and create prompt invariant routing.  This is observed empirically
+    # in the 30B-A3B checkpoint.
+    enable_input_bias: bool = True
+
     log_enc_time_every_n: int = 100  # Frequency of logging encoding time to W&B
+
+    # When True, ``OmniMoTModel.state_dict`` / ``load_state_dict`` skip the
+    # reasoner (und) pathway weights under ``language_model`` — i.e. every key
+    # WITHOUT a ``_moe_gen`` suffix (including ``visual`` / ``lm_head`` /
+    # ``embed_tokens``).  These are not written to checkpoints and are left
+    # untouched on load (typically already populated from the HF pretrained
+    # backbone).  Generation-pathway (``_moe_gen``) and VFM heads are saved /
+    # loaded as usual.
+    exclude_reasoner_weights_from_checkpoint: bool = False

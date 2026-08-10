@@ -29,11 +29,13 @@
 - [Training (Supervised Fine-Tuning)](./docs/training.md)
   - [JSONL Dataset](./docs/dataset_jsonl.md)
 - [Inference](./docs/inference.md)
+- [Policy Server](./docs/action_policy_droid_server.md)
+- [Agent Skills](#agent-skills)
 - Reference
   - [Code Structure](./docs/code_structure.md)
   - [Environment Variables](./docs/environment_variables.md)
   - [FAQ](./docs/faq.md)
-  - [AGENTS.md](./AGENTS.md)
+  - [AGENTS.md — repo map for coding agents](./AGENTS.md)
 
 ## Setup
 
@@ -55,7 +57,7 @@ uv sync --all-extras --group=cu130-train
 source .venv/bin/activate && export LD_LIBRARY_PATH=
 ```
 
-If you are starting from the recommended NGC image (`nvcr.io/nvidia/pytorch:25.09-py3`), see the [one-shot quickstart](./docs/setup.md#quickstart-from-the-recommended-base-image).
+If you are starting from the recommended NGC image (`nvcr.io/nvidia/pytorch:26.06-py3`), see the [one-shot quickstart](./docs/setup.md#quickstart-from-the-recommended-base-image).
 
 ## Training
 
@@ -82,12 +84,39 @@ python -m cosmos_framework.scripts.inference \
     --seed=0
 ```
 
+## Policy Server
+
+See [Policy Server](./docs/action_policy_droid_server.md) for the full guide.
+
+## Agent Skills
+
+Coding agents (Claude Code, Codex CLI, Cursor, and other AGENTS.md-aware
+tools) can load task-specific instructions for this repo from the bundled
+AgentSkills. Each skill is a self-contained `SKILL.md` that the agent
+invokes automatically when the user's request matches its description.
+
+Skills live in [`.agents/skills/`](./.agents/skills) (canonical) and are
+mirrored under [`.claude/skills/`](./.claude/skills) for Claude Code:
+
+| Skill                                                                            | When it activates                                                                    |
+| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| [`cosmos3-setup`](./.agents/skills/cosmos3-setup/SKILL.md)                       | Installation, environment setup, checkpoint downloads, Docker.                       |
+| [`cosmos3-codebase-nav`](./.agents/skills/cosmos3-codebase-nav/SKILL.md)         | "Where is X" / "where do I change parameter Y" questions across `cosmos_framework/`. |
+| [`cosmos3-inference`](./.agents/skills/cosmos3-inference/SKILL.md)               | Running offline or online inference, parallelism, sampling parameters.               |
+| [`cosmos3-post-training`](./.agents/skills/cosmos3-post-training/SKILL.md)       | SFT post-training end-to-end: data prep, DCP conversion, launch, export.             |
+| [`cosmos3-env-troubleshoot`](./.agents/skills/cosmos3-env-troubleshoot/SKILL.md) | Diagnosing install/runtime errors (ImportError, CUDA, Docker, checkpoint failures).  |
+
+See [`AGENTS.md`](./AGENTS.md) for the canonical repo map that agents load
+first; the skills above are referenced from there.
+
 ## Reference
 
-| Topic                                                        | What it covers                                                                                                           |
-| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| [Setup](./docs/setup.md)                                     | Hardware/software prerequisites, `uv` install paths, CUDA variants, Docker base image, and base-checkpoint downloading.  |
-| [Code Structure](./docs/code_structure.md)                   | Repository layout and a per-subpackage tour of `cosmos_framework/` — where each concern lives and where to add new code. |
-| [Training](./docs/training.md)                               | Launching multi-GPU and multi-node runs; parallelism strategies; mixed precision; resuming.                              |
-| [Inference (from a trained checkpoint)](./docs/inference.md) | Loading a trained checkpoint into one of the inference backends.                                                         |
-| [FAQ](./docs/faq.md)                                         | Troubleshooting (OOM, NCCL hangs, slow training), environment variables, and common pitfalls.                            |
+| Topic                                                        | What it covers                                                                                                                            |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| [Setup](./docs/setup.md)                                     | Hardware/software prerequisites, `uv` install paths, CUDA variants, Docker base image, and base-checkpoint downloading.                   |
+| [Code Structure](./docs/code_structure.md)                   | Repository layout and a per-subpackage tour of `cosmos_framework/` — where each concern lives and where to add new code.                  |
+| [Training](./docs/training.md)                               | Launching multi-GPU and multi-node runs; parallelism strategies; mixed precision; resuming.                                               |
+| [Inference (from a trained checkpoint)](./docs/inference.md) | Loading a trained checkpoint into one of the inference backends.                                                                          |
+| [Policy Server](./docs/action_policy_droid_server.md)        | Running the server-client pipeline for Cosmos3-Policy-DROID.                                                                              |
+| [FAQ](./docs/faq.md)                                         | Troubleshooting (OOM, NCCL hangs, slow training), environment variables, and common pitfalls.                                             |
+| [AGENTS.md](./AGENTS.md) + [Agent Skills](#agent-skills)     | Repo map and task-specific `SKILL.md` files loaded automatically by AGENTS.md-aware coding agents (Claude Code, Codex CLI, Cursor, etc.). |

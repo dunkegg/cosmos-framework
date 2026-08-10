@@ -24,6 +24,7 @@ from cosmos_framework.model.tokenizer.models.modules.attention.full_attn import 
     sparse_scaled_dot_product_attention,
     tensor_varlen_scaled_dot_product_attention,
 )
+from cosmos_framework.model.tokenizer.utils.tensors import cat_with_bounded_inputs
 
 if TYPE_CHECKING:
     from cosmos_framework.model.tokenizer.models.modules.sparse_tensor import SparseTensor
@@ -89,7 +90,7 @@ def _manual_segmented_scaled_dot_product_attention(
         )
 
     if out_chunks:
-        output = torch.cat(out_chunks, dim=0)  # [Tq,H,D]
+        output = cat_with_bounded_inputs(out_chunks, dim=0)  # [Tq,H,D]
     else:
         output = q.new_empty((0, q.shape[1], v.shape[-1]))  # [0,H,D]
     captured_attn = attn_chunks if store_attn else None
@@ -103,7 +104,7 @@ class RotaryPositionEmbedder(nn.Module):
     Uses all 4 position dimensions (t, h, w, z) for proper 4D position encoding.
     """
 
-    def __init__(self, head_dim: int, pos_cls_token: int = 0):
+    def __init__(self, head_dim: int, pos_cls_token: int = 0) -> None:
         """Initialize RotaryPositionEmbedder.
 
         Args:
@@ -306,7 +307,7 @@ class SparseMultiHeadRMSNorm(nn.Module):
     Applies RMS normalization with per-head learnable scale parameters.
     """
 
-    def __init__(self, dim: int, heads: int):
+    def __init__(self, dim: int, heads: int) -> None:
         """Initialize SparseMultiHeadRMSNorm.
 
         Args:
@@ -372,7 +373,7 @@ class SparseMultiHeadAttention(nn.Module):
         qk_rms_norm: bool = False,
         out_channels: int | None = None,
         pos_cls_token: int = 0,
-    ):
+    ) -> None:
         """Initialize SparseMultiHeadAttention.
 
         Args:
@@ -525,14 +526,6 @@ class SparseMultiHeadAttention(nn.Module):
             x_feats = x
         x_feats = x_feats.reshape(*x_feats.shape[:2], num_fused, self.num_heads, -1)
         return x.replace(x_feats.squeeze(0)) if isinstance(x, SparseTensor) else x_feats
-
-    def _qkv_rope(self, qkv: "SparseTensor") -> "SparseTensor":
-        """Apply RoPE to packed QKV tensor."""
-        q, k, v = qkv.feats.unbind(dim=1)
-        freqs_cis = self.rope.get_cached_freqs_cis(qkv, qkv.coords[:, 1:])
-        q, k = self.rope.apply_rotary_emb(q, k, freqs_cis=freqs_cis, xk_freqs_cis=freqs_cis)
-        qkv = qkv.replace(torch.stack([q, k, v], dim=1))
-        return qkv
 
     def _q_kv_rope(
         self,
@@ -927,7 +920,7 @@ class SparseMultiHeadAttention(nn.Module):
 
             if not combined_parts:
                 return current_freqs_cis.new_empty((0,) + current_freqs_cis.shape[1:])
-            return torch.cat(combined_parts, dim=0)
+            return cat_with_bounded_inputs(combined_parts, dim=0)
 
         combined_parts = []
         current_batch_size = current.shape[0]
@@ -966,7 +959,7 @@ class SparseMultiHeadAttention(nn.Module):
 
         if not combined_parts:
             return current_freqs_cis.new_empty((0,) + current_freqs_cis.shape[1:])
-        return torch.cat(combined_parts, dim=0)
+        return cat_with_bounded_inputs(combined_parts, dim=0)
 
     def _concat_temporal_sparse(self, cached: "SparseTensor", current: "SparseTensor") -> "SparseTensor":
         """Concatenate cached and current sparse tensors along temporal dimension.
@@ -1044,9 +1037,9 @@ class SparseMultiHeadAttention(nn.Module):
                     offset += batch_len
 
                 if cached_coords_parts:
-                    selected_coords = torch.cat(cached_coords_parts, dim=0)
-                    cached_k_feats = torch.cat(cached_k_parts, dim=0)
-                    cached_v_feats = torch.cat(cached_v_parts, dim=0)
+                    selected_coords = cat_with_bounded_inputs(cached_coords_parts, dim=0)
+                    cached_k_feats = cat_with_bounded_inputs(cached_k_parts, dim=0)
+                    cached_v_feats = cat_with_bounded_inputs(cached_v_parts, dim=0)
                 else:
                     selected_coords = torch.empty(
                         (0, k.coords.shape[1]),
@@ -1087,7 +1080,7 @@ class SparseMultiHeadAttention(nn.Module):
                 kv_cache["cached_v"] = cached_v
                 if k_freqs_cis is not None:
                     if cached_freq_parts:
-                        cached_k_freqs_cis = torch.cat(cached_freq_parts, dim=0)
+                        cached_k_freqs_cis = cat_with_bounded_inputs(cached_freq_parts, dim=0)
                     else:
                         cached_k_freqs_cis = k_freqs_cis.new_empty((0,) + k_freqs_cis.shape[1:])
                     if kv_cache_detach:

@@ -10,15 +10,17 @@ import pynvml
 from loguru import logger as logging
 
 
-def get_gpu_architecture():
+def get_gpu_architecture() -> str:
     """
     Retrieves the GPU architecture of the available GPUs.
 
     Returns:
         str: The GPU architecture, which can be "H100", "A100", or "Other".
     """
+    nvml_initialized = False
     try:
         pynvml.nvmlInit()
+        nvml_initialized = True
         device_count = pynvml.nvmlDeviceGetCount()
         for i in range(device_count):
             handle = pynvml.nvmlDeviceGetHandleByIndex(i)
@@ -39,7 +41,8 @@ def get_gpu_architecture():
     except pynvml.NVMLError as error:
         print(f"Failed to get GPU info: {error}")
     finally:
-        pynvml.nvmlShutdown()
+        if nvml_initialized:
+            pynvml.nvmlShutdown()
 
     # return "Other" incase of non hopper/ampere or error
     return "Other"
@@ -85,20 +88,16 @@ def gpu0_has_80gb_or_less():
 
 class Device:
 
-
     _nvml_affinity_elements = math.ceil(os.cpu_count() / 64)  # type: ignore
 
     def __init__(self, device_idx: int):
-
         super().__init__()
         self.handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
 
     def get_name(self) -> str:
-
         return pynvml.nvmlDeviceGetName(self.handle)
 
     def get_cpu_affinity(self) -> list[int]:
-
         affinity_string = ""
         for j in pynvml.nvmlDeviceGetCpuAffinity(self.handle, Device._nvml_affinity_elements):
             # assume nvml returns list of 64 bit ints

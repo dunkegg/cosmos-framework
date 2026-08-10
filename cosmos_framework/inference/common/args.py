@@ -3,11 +3,14 @@
 
 import contextlib
 import glob
+import hashlib
 import itertools
 import json
 import os
+import random
 import re
 import tempfile
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import (
@@ -52,7 +55,47 @@ VIDEO_EXTENSIONS = [".mp4"]
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
 
 
+# Retry transient download errors with exponential backoff (env-overridable).
+_DOWNLOAD_MAX_ATTEMPTS = int(os.environ.get("COSMOS_DOWNLOAD_MAX_ATTEMPTS", "6"))
+_DOWNLOAD_BACKOFF_BASE_S = float(os.environ.get("COSMOS_DOWNLOAD_BACKOFF_S", "4"))
+_DOWNLOAD_BACKOFF_CAP_S = float(os.environ.get("COSMOS_DOWNLOAD_BACKOFF_CAP_S", "60"))
+
+# Statuses not worth retrying.
+_PERMANENT_HTTP_MARKERS = ("400 Bad Request", "401 Unauthorized", "403 Forbidden", "404 Not Found")
+
+
+def _is_permanent_download_error(exc: BaseException) -> bool:
+    if type(exc).__name__ in {"NotFoundError", "PermissionError"}:
+        return True
+    msg = str(exc)
+    return any(marker in msg for marker in _PERMANENT_HTTP_MARKERS)
+
+
 def _download_file_url(url: str, path: Path):
+    """Download ``url`` to ``path``, retrying transient network/server errors."""
+    from cosmos_framework.utils import log
+
+    last_exc: BaseException | None = None
+    for attempt in range(1, _DOWNLOAD_MAX_ATTEMPTS + 1):
+        try:
+            _download_file_url_once(url, path)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if _is_permanent_download_error(exc) or attempt == _DOWNLOAD_MAX_ATTEMPTS:
+                break
+            delay = min(_DOWNLOAD_BACKOFF_CAP_S, _DOWNLOAD_BACKOFF_BASE_S * 2 ** (attempt - 1))
+            delay += random.uniform(0, delay * 0.25)  # jitter
+            log.warning(
+                f"Download attempt {attempt}/{_DOWNLOAD_MAX_ATTEMPTS} for {url} failed "
+                f"({type(exc).__name__}: {exc}); retrying in {delay:.1f}s."
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(f"Failed to download {url} after {_DOWNLOAD_MAX_ATTEMPTS} attempt(s)") from last_exc
+
+
+def _download_file_url_once(url: str, path: Path):
     if "huggingface.co" in url:
         _download_file_hf(url, path)
     else:
@@ -85,6 +128,33 @@ def _download_file_hf(url: str, path: Path):
             f.write(chunk)
 
 
+def _resolve_url_download(url: str, name: str) -> Path:
+    """Fetch ``url`` to a local file and return its path.
+
+    When ``COSMOS_DOWNLOAD_CACHE_DIR`` is set, downloads are cached there by URL
+    and reused across runs; otherwise a fresh temp dir is used per download.
+    """
+    cache_root = os.environ.get("COSMOS_DOWNLOAD_CACHE_DIR")
+    if not cache_root:
+        local_path = Path(tempfile.mkdtemp()) / name
+        _download_file_url(url, local_path)
+        return local_path
+
+    cache_dir = Path(cache_root)
+    digest = hashlib.sha256(url.encode()).hexdigest()[:16]
+    cache_path = cache_dir / f"{digest}-{name}"
+    done_marker = Path(f"{cache_path}.done")
+    if cache_path.exists() and done_marker.exists():
+        return cache_path
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Atomic move so concurrent writers never observe a half-written file.
+    tmp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
+    _download_file_url(url, tmp_path)
+    os.replace(tmp_path, cache_path)
+    done_marker.write_text(url)
+    return cache_path
+
+
 def _download_file(url: str, path: Path):
     if "://" not in url and Path(url).resolve() == path.resolve():
         return
@@ -94,10 +164,9 @@ def _download_file(url: str, path: Path):
             return
 
     if "://" in url:
-        # Download to a temporary directory and symlink to the final path.
-        # This keeps the output directory small.
-        local_path = Path(tempfile.TemporaryDirectory(delete=False).name) / path.name
-        _download_file_url(url, local_path)
+        # Download (optionally via the persistent cache) and symlink to the final
+        # path. This keeps the output directory small.
+        local_path = _resolve_url_download(url, path.name)
     else:
         local_path = Path(url)
 
@@ -313,7 +382,11 @@ class ConfigArgs(ArgsBase):
             case ConfigFileType.MODULE:
                 return unstructure_config(self.load_config().model)
             case ConfigFileType.YAML | ConfigFileType.JSON:
-                return load_model_config_from_hf_config(deserialize_config_dict(Path(self.config_file)))
+                config_dict = deserialize_config_dict(Path(self.config_file))
+                overrides_omegaconf = OmegaConf.from_dotlist(self.experiment_overrides)
+                config_dict = OmegaConf.to_container(OmegaConf.merge(config_dict, overrides_omegaconf), resolve=False)
+                assert isinstance(config_dict, dict)
+                return load_model_config_from_hf_config(config_dict)
             case _:
                 assert_never(self.config_file_type)
 
@@ -355,9 +428,18 @@ class CheckpointType(StrEnum):
 
     @classmethod
     def from_path(cls, path: Path) -> Self:
-        has_hf_weights = any(path.glob("*.safetensors")) or any(path.glob("*.safetensors.index.json"))
+        transformer_path = path / "transformer"
+        has_root_hf_weights = any(path.glob("*.safetensors")) or any(path.glob("*.safetensors.index.json"))
+        has_diffusers_hf_weights = (path / "model_index.json").is_file() and (
+            any(transformer_path.glob("*.safetensors"))
+            or any(transformer_path.glob("*.safetensors.index.json"))
+        )
+        has_hf_weights = has_root_hf_weights or has_diffusers_hf_weights
         if has_hf_weights:
-            if not (path / "config.json").exists():
+            has_hf_config = (path / "config.json").is_file() or (
+                has_diffusers_hf_weights and (transformer_path / "config.json").is_file()
+            )
+            if not has_hf_config:
                 raise ValueError(f"Invalid Hugging Face checkpoint: {path}")
             return cls("hf")
         if any(path.glob("*.distcp")):
@@ -394,6 +476,13 @@ class CheckpointConfig(pydantic.BaseModel):
     at the repository root (e.g. the task-specialized Text2Image / Image2Video
     diffusers checkpoints). Avoids a redundant download of the base model repo
     just to obtain the tokenizer.
+    """
+
+    experiment_overrides: tuple[str, ...] = ()
+    """Config defaults required by this checkpoint.
+
+    These are applied before command-line experiment overrides so callers can
+    still override a checkpoint default explicitly.
     """
 
     def download(self) -> str:
@@ -474,12 +563,15 @@ class CheckpointOverrides(ConfigOverrides):
             self.config_file = checkpoint.config_file
             self.checkpoint_hf = checkpoint.hf
             self.vlm_processor_from_checkpoint = checkpoint.vlm_processor_from_checkpoint
+            for value in reversed(checkpoint.experiment_overrides):
+                if value not in self.experiment_overrides:
+                    self.experiment_overrides.insert(0, value)
         elif self.checkpoint_path.startswith("s3://"):
             self.checkpoint_type = CheckpointType.DCP
             self.checkpoint_path = self.checkpoint_path.rstrip("/")
             # Strip '/model' suffix, since it isn't included in checkpoint_db.
             # Automatically added during checkpoint load by
-            # 'cosmos_framework.utils.vfm.model_loader.load_model_from_checkpoint'.
+            # 'cosmos_framework.utils.generator.model_loader.load_model_from_checkpoint'.
             if not self.checkpoint_path.endswith("/model"):
                 self.checkpoint_path = self.checkpoint_path + "/model"
         else:
@@ -533,6 +625,38 @@ class CheckpointOverrides(ConfigOverrides):
 ParallelismPreset = Literal["throughput", "latency"]
 CfgpSize = Annotated[int, pydantic.Field(ge=1, le=2)]
 CompiledRegion = Literal["all", "language"]
+
+# Low-precision quantization method to apply to the model at load time.
+# One of ``mxfp8`` / ``nvfp4``, or ``None`` (default) to disable.
+# Routed to the VFM model loader, which selects an FSDP-compatible
+# (module-swap) path when sharded (``dp_shard_size > 1``) and an in-place
+# path when replicated (``dp_shard_size == 1``). Note ``mxfp8`` / ``nvfp4``
+# are only supported on the replicated path.
+QuantizationMethod = Literal["mxfp8", "nvfp4"]
+
+
+class QuantizationArgs(ArgsBase):
+    """Low-precision quantization arguments applied to the model at load time."""
+
+    quantization_method: QuantizationMethod | None
+    quantization_include_regex: list[str]
+    quantization_exclude_regex: list[str]
+
+
+class QuantizationOverrides(OverridesBase):
+    quantization_method: QuantizationMethod | None = None
+    """Quantization method (``mxfp8`` / ``nvfp4``), or ``None`` to disable.
+
+    Post-training quantization (PTQ) is applied in-place to the model at load
+    time. Only supported on Blackwell architectures and when FSDP sharding is disabled.
+    """
+    quantization_include_regex: list[str] = ["language_model.model.layers"]
+    """Regexes matched against module FQNs; a Linear is quantized only if it matches one (empty = all)."""
+    quantization_exclude_regex: list[str] = pydantic.Field(default_factory=list)
+    """Regexes matched against module FQNs; a Linear is skipped if it matches any."""
+
+    def build_quantization(self) -> QuantizationArgs:
+        return self._build(QuantizationArgs)
 
 
 class ParallelismArgs(ArgsBase):
@@ -633,7 +757,7 @@ class GuardrailOverrides(OverridesBase):
     """Offload guardrail models to CPU."""
 
 
-class SetupArgs(ABC, CheckpointArgs, ParallelismArgs, GuardrailArgs):
+class SetupArgs(ABC, CheckpointArgs, ParallelismArgs, QuantizationArgs, GuardrailArgs):
     output_dir: ResolvedPath
     keep_going: bool
     skip_invalid_samples: bool
@@ -641,6 +765,7 @@ class SetupArgs(ABC, CheckpointArgs, ParallelismArgs, GuardrailArgs):
     profile: bool
     benchmark: bool
     warmup: pydantic.NonNegativeInt
+    num_iterations: pydantic.PositiveInt
     max_model_len: pydantic.PositiveInt | None
     max_num_seqs: pydantic.PositiveInt | None
 
@@ -668,7 +793,7 @@ class SetupArgs(ABC, CheckpointArgs, ParallelismArgs, GuardrailArgs):
         return cls.model_fields["variant"].default
 
 
-class SetupOverrides(ABC, CheckpointOverrides, ParallelismOverrides, GuardrailOverrides):
+class SetupOverrides(ABC, CheckpointOverrides, ParallelismOverrides, QuantizationOverrides, GuardrailOverrides):
     """Inference setup arguments."""
 
     output_dir: Annotated[ResolvedPath | None, tyro.conf.arg(aliases=("-o",))] = None
@@ -687,6 +812,8 @@ class SetupOverrides(ABC, CheckpointOverrides, ParallelismOverrides, GuardrailOv
     """If set, measures and reports inference runtime (disables tqdm)."""
     warmup: pydantic.NonNegativeInt = 0
     """Number of warmup generations before each sample."""
+    num_iterations: pydantic.PositiveInt = 1
+    """Number of benchmark generations to run after warmup."""
     max_model_len: pydantic.PositiveInt | None = None
     """Maximum total tokens per batch.  When set, samples are packed into
     batches by token count."""
@@ -695,7 +822,8 @@ class SetupOverrides(ABC, CheckpointOverrides, ParallelismOverrides, GuardrailOv
     batches by number of sequences."""
 
     def _build_setup(self):
-        pass
+        if self.num_iterations > 1 and not self.benchmark:
+            raise ValueError("num_iterations > 1 requires benchmark=True")
 
     @abstractmethod
     def build_setup(self) -> SetupArgs:

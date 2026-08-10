@@ -4,7 +4,7 @@
 import hashlib
 import json
 import pickle
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Callable, Generator, Iterable, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Sequence, TypeVar, cast, override
@@ -15,10 +15,14 @@ import cattrs.preconf.json
 import safetensors.torch
 import torch
 from PIL import Image
+from qwen_vl_utils.vision_process import smart_nframes
 from torch.utils._pytree import tree_map_only
 from torch.utils.data import Dataset
 from typing_extensions import Self
 
+from cosmos_framework.configs.base.defaults.compile import CompileConfig
+from cosmos_framework.configs.base.defaults.parallelism import ParallelismConfig
+from cosmos_framework.configs.base.defaults.quantization import QuantizationConfig
 from cosmos_framework.inference.args import (
     ModelMode,
     NegativeMetadataMode,
@@ -26,6 +30,7 @@ from cosmos_framework.inference.args import (
     OmniSetupArgs,
 )
 from cosmos_framework.inference.common.args import (
+    VIDEO_EXTENSIONS,
     CheckpointType,
     ConfigFileType,
     ParallelismArgs,
@@ -34,25 +39,25 @@ from cosmos_framework.inference.common.args import (
     SampleOutputs,
     SetupArgs,
 )
-from cosmos_framework.inference.common.inference import Inference, sync_distributed_errors
+from cosmos_framework.inference.common.inference import Inference, _download_on_rank0, sync_distributed_errors
 from cosmos_framework.inference.common.init import get_rank, get_world_size
 from cosmos_framework.inference.model import Cosmos3OmniConfig, Cosmos3OmniModel
 from cosmos_framework.inference.vision import (
     build_conditioned_video_batch,
     build_image_edit_batch,
+    decode_video_thwc_uint8,
     load_conditioning_image,
     load_conditioning_video,
     load_prompt_upsampling_image,
     pil_to_conditioning_frames,
     resize_pil_image,
 )
-from cosmos_framework.utils import log
+from cosmos_framework.model.generator.omni_mot_model import OmniMoTModel
+from cosmos_framework.model.generator.reasoner.qwen3_vl.utils import _SYSTEM_PROMPT_IMAGE_EDITING
+from cosmos_framework.model.generator.upsampler.prompts import is_upsampled_prompt
 from cosmos_framework.tools.visualize.video import save_img_or_video
-from cosmos_framework.configs.base.defaults.compile import CompileConfig
-from cosmos_framework.configs.base.defaults.parallelism import ParallelismConfig
-from cosmos_framework.model.vfm.omni_mot_model import OmniMoTModel
-from cosmos_framework.model.vfm.vlm.qwen3_vl.utils import _SYSTEM_PROMPT_IMAGE_EDITING
-from cosmos_framework.model.vfm.upsampler.prompts import is_upsampled_prompt
+from cosmos_framework.utils import log
+from cosmos_framework.utils.checkpoint_db import CheckpointDirHf
 
 if TYPE_CHECKING:
     from cosmos_framework.configs.base.defaults.model_config import OmniMoTModelConfig
@@ -61,6 +66,110 @@ UpsampleTask = Literal["t2i", "t2v", "i2v"]
 
 
 _BatchItem = TypeVar("_BatchItem")
+
+_PROCESSOR_HF_INCLUDE = (
+    "*.json",
+    "*.jinja",
+    "merges.txt",
+    "vocab.json",
+)
+
+
+def _checkpoint_has_processor_files(checkpoint_path: Path) -> bool:
+    """True when the checkpoint dir bundles VLM processor/tokenizer files at its root."""
+    return any((checkpoint_path / name).is_file() for name in ("tokenizer_config.json", "preprocessor_config.json"))
+
+
+# Files ``Qwen2Tokenizer.from_pretrained`` reads from a local directory: its
+# ``vocab_files_names`` (vocab.json + merges.txt, both opened unconditionally in
+# ``__init__``) plus tokenizer_config.json, which carries the added special
+# tokens (<|vision_start|> etc.) the SFT data pipeline depends on.
+_QWEN2_TOKENIZER_FILES = ("tokenizer_config.json", "vocab.json", "merges.txt")
+
+# ``tokenizer_type`` substrings that ``build_processor`` maps to Qwen3VLProcessor
+# in hub mode — the same processor its local-directory mode defaults to, so a
+# rewrite to a bundled dir preserves the dispatch for these nodes.
+_QWEN3VL_TOKENIZER_TYPES = ("Qwen/Qwen3-VL", "Siglip2-Qwen3-1.7B")
+
+# Repos served by the native Cosmos3-Edge (Nemotron bridge) processor; covers
+# nvidia/Cosmos3-Edge and nvidia/Cosmos3-Edge-Reasoner (mirrors the substring
+# dispatch in ``build_processor``).
+_EDGE_REPO_SUBSTRING = "nvidia/Cosmos3-Edge"
+
+
+def _tokenizer_node_target(tokenizer_cfg: MutableMapping[str, Any]) -> str:
+    """Last component of the node's ``_target_`` (e.g. ``build_processor_lazy``)."""
+    return str(tokenizer_cfg.get("_target_", "")).rsplit(".", 1)[-1]
+
+
+def _dir_serves_qwen3vl_autoprocessor(path: Path) -> bool:
+    """True when ``path`` holds the files Qwen3VLProcessor's AutoProcessor load needs.
+
+    That is the image/video preprocessor params, the tokenizer config, and the
+    tokenizer data (fast ``tokenizer.json`` or the slow vocab/merges pair).
+    """
+    if not all((path / name).is_file() for name in ("preprocessor_config.json", "tokenizer_config.json")):
+        return False
+    return (path / "tokenizer.json").is_file() or all((path / name).is_file() for name in ("vocab.json", "merges.txt"))
+
+
+def _bundled_processor_serves_node(tokenizer_cfg: MutableMapping[str, Any], checkpoint_path: Path) -> bool:
+    """True when checkpoint-bundled processor files can serve this ``vlm_config.tokenizer`` node.
+
+    Gates the local-first override (``_point_tokenizer_node_at_dir``) on the
+    bundle being dispatchable for the node's shape: Edge-family nodes need the
+    native-snapshot markers, Qwen3-VL-family nodes the AutoProcessor file set,
+    and Qwen2 nodes take a local dir only with ``config_variant="hf"``. Unknown
+    shapes return False (keep the configured hub behavior).
+    """
+    if not isinstance(tokenizer_cfg, MutableMapping):
+        return False
+    target = _tokenizer_node_target(tokenizer_cfg)
+    if target == "build_processor_lazy":
+        from cosmos_framework.data.generator.processors.cosmos3_edge_processing import is_cosmos3_edge_native_snapshot
+
+        repository = tokenizer_cfg.get("repository")
+        name = repository or tokenizer_cfg.get("tokenizer_type")
+        if not isinstance(name, str) or not name:
+            return False
+        if _EDGE_REPO_SUBSTRING in name:
+            return is_cosmos3_edge_native_snapshot(str(checkpoint_path))
+        if repository or any(qwen_type in name for qwen_type in _QWEN3VL_TOKENIZER_TYPES):
+            # Local-artifact (repository) nodes and Qwen3-VL tokenizer types both
+            # dispatch to Qwen3VLProcessor in dir mode; an edge-native bundle
+            # would instead route to the Nemotron bridge, so reject it.
+            return _dir_serves_qwen3vl_autoprocessor(checkpoint_path) and not is_cosmos3_edge_native_snapshot(
+                str(checkpoint_path)
+            )
+        return False
+    if target == "create_qwen2_tokenizer_with_download":
+        if tokenizer_cfg.get("config_variant") != "hf" or not tokenizer_cfg.get("pretrained_model_name"):
+            return False
+        return all((checkpoint_path / name).is_file() for name in _QWEN2_TOKENIZER_FILES)
+    return False
+
+
+def _point_tokenizer_node_at_dir(tokenizer_cfg: MutableMapping[str, Any], processor_path: Path | str) -> bool:
+    """Rewrite ``vlm_config.tokenizer`` in place to source its processor from a local dir.
+
+    Dispatches on the node's shape so the mutated kwargs match the target's
+    signature (``build_processor_lazy`` takes ``tokenizer_type``; the Qwen2 node
+    takes ``pretrained_model_name``). Returns False — node left completely
+    untouched — for any other shape, so callers keep the configured hub behavior.
+    """
+    if not isinstance(tokenizer_cfg, MutableMapping):
+        return False
+    target = _tokenizer_node_target(tokenizer_cfg)
+    if target == "build_processor_lazy" and (tokenizer_cfg.get("repository") or tokenizer_cfg.get("tokenizer_type")):
+        tokenizer_cfg.pop("repository", None)
+        tokenizer_cfg.pop("revision", None)
+        tokenizer_cfg.pop("subdir", None)
+        tokenizer_cfg["tokenizer_type"] = str(processor_path)
+        return True
+    if target == "create_qwen2_tokenizer_with_download" and tokenizer_cfg.get("config_variant") == "hf":
+        tokenizer_cfg["pretrained_model_name"] = str(processor_path)
+        return True
+    return False
 
 
 def _iter_packed_batches(
@@ -182,8 +291,13 @@ def _compute_num_tokens_for_sample(sample_args: OmniSampleArgs, model: OmniMoTMo
     w, h = sample_args.vision_size
     T = sample_args.num_frames
 
-    spatial_cf = cast(int, model.tokenizer_vision_gen.spatial_compression_factor)
-    temporal_cf = cast(int, model.tokenizer_vision_gen.temporal_compression_factor)
+    vision_tokenizer = model.tokenizer_vision_gen
+    if vision_tokenizer is None:
+        spatial_cf = cast(int, model.config.tokenizer.spatial_compression_factor)
+        temporal_cf = cast(int, model.config.tokenizer.temporal_compression_factor)
+    else:
+        spatial_cf = vision_tokenizer.spatial_compression_factor
+        temporal_cf = vision_tokenizer.temporal_compression_factor
     patch_spatial: int = model.config.diffusion_expert_config.patch_spatial
 
     vae_spatial_downsample = spatial_cf * patch_spatial
@@ -193,7 +307,6 @@ def _compute_num_tokens_for_sample(sample_args: OmniSampleArgs, model: OmniMoTMo
     latent_w = w // vae_spatial_downsample
     latent_t = 1 + (T - 1) // vae_temporal_downsample
     num_vision_tokens = latent_h * latent_w * latent_t
-
 
     # small compared to vision tokens, so we can ignore them for now.
 
@@ -463,14 +576,43 @@ def _get_prompt_sample_data(sample_args: OmniSampleArgs, model: OmniMoTModel, *,
     return out
 
 
+def _decode_reasoner_video(vision_path: str, video_fps: float | None) -> dict[str, Any]:
+    """Decode a local video file into the frame-list payload the Qwen3-VL processor expects.
+
+    Returns ``{"frames": [PIL.Image, ...], "fps": float}``. Uses the same TorchCodec
+    decode the rest of the inference path relies on (no ``decord`` dependency), then
+    uniformly samples frames toward ``video_fps`` (default 2.0) via Qwen's
+    ``smart_nframes``. The repo ``Qwen3VLProcessor`` runs with ``do_sample_frames=False``,
+    so it consumes this pre-sampled frame list as-is and handles its own per-frame resize."""
+    frames, src_fps = decode_video_thwc_uint8(Path(vision_path))  # [T,H,W,C] uint8
+    total_frames = int(frames.shape[0])
+    if total_frames == 0:
+        raise ValueError(f"Decoded zero frames from reasoner video: {vision_path}")
+    src_fps = src_fps or 1.0
+    target_fps = video_fps if video_fps is not None else 2.0
+    nframes = smart_nframes({"fps": target_fps}, total_frames=total_frames, video_fps=src_fps)
+    idx = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
+    pil_frames = [Image.fromarray(frames[i].numpy()) for i in idx]
+    sample_fps = nframes / total_frames * src_fps
+    return {"frames": pil_frames, "fps": sample_fps}
+
+
 def _get_reasoner_sample_data(sample_args: OmniSampleArgs, model: OmniMoTModel) -> dict[str, Any]:
-    """Sample batch for reasoner text generation: prompt + optional conditioning image."""
+    """Sample batch for reasoner text generation: prompt + optional conditioning image or video."""
     image: Image.Image | None = None
+    video: dict[str, Any] | None = None
     if sample_args.vision_path is not None:
-        image = Image.open(sample_args.vision_path).convert("RGB")
+        if Path(sample_args.vision_path).suffix.lower() in VIDEO_EXTENSIONS:
+            video = _decode_reasoner_video(str(sample_args.vision_path), sample_args.video_fps)
+        else:
+            image = Image.open(sample_args.vision_path).convert("RGB")
+    # Both keys are emitted for every sample (``None`` when absent) so the batch
+    # builder can positionally align them and the three-way homogeneity check in
+    # ``_generate_reasoner_batch`` reliably detects an image/video/text mix.
     return {
         model.input_caption_key: [sample_args.prompt],
         "reasoner_images": [image],
+        "reasoner_videos": [video],
     }
 
 
@@ -507,6 +649,9 @@ def get_sample_data(
     if sample_args.model_mode.is_reasoner:
         return _get_reasoner_sample_data(sample_args, model)
 
+    if sample_args.transfer_hints:
+        return {}
+
     if sample_args.model_mode.is_action:
         from cosmos_framework.inference.action import get_action_sample_data
 
@@ -526,7 +671,6 @@ def get_sample_data(
             fps=sample_args.fps,
             device=device,
         )
-
 
     if sample_args.model_mode == ModelMode.IMAGE2IMAGE:
         return _get_image_edit_sample_data(sample_args, model, device=device)
@@ -609,17 +753,29 @@ def get_sample_data(
                 create_placeholder_audio,
                 get_audio_tokenizer_info,
                 inject_sound_into_batch,
+                load_conditioning_audio,
             )
 
             audio_info = get_audio_tokenizer_info(model)
             if not audio_info.has_sound:
                 raise ValueError("enable_sound=True but model has no sound tokenizer")
-            audio_placeholder = create_placeholder_audio(
-                num_frames=sample_args.num_frames,
-                conditioning_fps=sample_args.fps,
-                audio_info=audio_info,
-            )
-            inject_sound_into_batch(out, audio_placeholder, model)
+
+            condition_sound = sample_args.sound_path is not None
+            if condition_sound:
+                num_samples = int(sample_args.num_frames / sample_args.fps * audio_info.sample_rate)
+                audio = load_conditioning_audio(
+                    Path(sample_args.sound_path),
+                    sample_rate=audio_info.sample_rate,
+                    audio_channels=getattr(audio_info.tokenizer, "audio_channels", 2),
+                    num_samples=num_samples,
+                )
+            else:
+                audio = create_placeholder_audio(
+                    num_frames=sample_args.num_frames,
+                    conditioning_fps=sample_args.fps,
+                    audio_info=audio_info,
+                )
+            inject_sound_into_batch(out, audio, model, condition_sound=condition_sound)
 
         return out
 
@@ -883,18 +1039,17 @@ def create_batches_from_dataset(
 def _finalize_data_batch(data_batch: dict[str, Any], batch_size: int, model: OmniMoTModel) -> dict[str, Any]:
     """Return a finalized + validated copy of *data_batch*.
 
-    All mutations (key renames, tensor → list unbind) are applied to a fresh
-    shallow copy so the caller's input dict is never modified.  This keeps
+    All mutations (key renames, tensor → list unbind, or list-item replacement)
+    are applied to a fresh copy so the caller's input dict is never modified. This keeps
     the "no aliasing" responsibility localized at the single place where the
     mutation happens, instead of forcing every producer of a data dict (e.g.
     seed-expansion fan-out in ``create_batches_from_dataset``, dummy padding
     batches in ``create_batches``) to defensively copy before handing the
     dict to ``generate_batch``.
 
-    Only the top-level dict structure is copied; tensor / list values inside
-    are shared with the input (which is safe because every mutation here is a
-    top-level key rename or value reassignment, never an in-place op on the
-    value itself).
+    The top-level dict and list containers are copied; tensors and other values
+    inside those lists remain shared. Copying each list is necessary because
+    downstream preprocessing replaces video-list items with normalized tensors.
 
     Args:
         data_batch: Input data dict.  Not modified.
@@ -910,7 +1065,7 @@ def _finalize_data_batch(data_batch: dict[str, Any], batch_size: int, model: Omn
             present, or if the post-finalize caption-list length doesn't
             match ``batch_size``.
     """
-    data_batch = dict(data_batch)
+    data_batch = {key: list(value) if isinstance(value, list) else value for key, value in data_batch.items()}
 
     for old_key, new_key in [
         ("video", model.input_video_key),
@@ -1007,6 +1162,14 @@ class OmniInference(Inference):
             compile_dynamic=setup_args.compile_dynamic,
         )
 
+    @classmethod
+    def _get_quantization_config(cls, setup_args: SetupArgs) -> QuantizationConfig:
+        return QuantizationConfig(
+            method=setup_args.quantization_method,
+            include_regex=list(setup_args.quantization_include_regex),
+            exclude_regex=list(setup_args.quantization_exclude_regex),
+        )
+
     @override
     @classmethod
     def _create(cls, setup_args: SetupArgs, **kwargs: Any) -> Self:
@@ -1016,9 +1179,10 @@ class OmniInference(Inference):
         sampler_override = setup_args.sampler
         parallelism_config = cls._get_parallelism_config(setup_args)
         compile_config = cls._get_compile_config(setup_args)
+        quantization_config = cls._get_quantization_config(setup_args)
         if setup_args.checkpoint_type == CheckpointType.DCP and setup_args.config_file_type == ConfigFileType.MODULE:
             from cosmos_framework.inference.common.config import save_config
-            from cosmos_framework.utils.vfm.model_loader import load_model_from_checkpoint
+            from cosmos_framework.utils.generator.model_loader import load_model_from_checkpoint
 
             if not setup_args.experiment:
                 raise ValueError("'experiment' is required")
@@ -1033,6 +1197,7 @@ class OmniInference(Inference):
                 credential_path=setup_args.credential_path or None,
                 parallelism_config=attrs.asdict(parallelism_config),
                 compile_config=attrs.asdict(compile_config),
+                quantization_config=attrs.asdict(quantization_config),
                 load_ema_to_reg=setup_args.use_ema_weights,
                 experiment_opts=[
                     *setup_args.experiment_overrides,
@@ -1043,28 +1208,85 @@ class OmniInference(Inference):
             )
             model = cast("OmniMoTModel", model)
             Cosmos3OmniModel.after_load_model(model)
+            # Thread a local checkpoint dir to the reasoner LM (consumed by
+            # Edge's lazy ``_ensure_vision_tower``) so a checkpoint-bundled
+            # ``vision_encoder/`` is preferred over a hub download. s3 DCP
+            # loads have no local dir to offer — skip them.
+            if "://" not in str(setup_args.checkpoint_path) and Path(setup_args.checkpoint_path).is_dir():
+                language_model = getattr(getattr(model, "net", None), "language_model", None)
+                if language_model is not None:
+                    language_model._local_checkpoint_dir = str(setup_args.checkpoint_path)
             save_config(config, setup_args.output_dir)
         else:
-            checkpoint_path = setup_args.download_checkpoint()
+            checkpoint_path = _download_on_rank0(setup_args.download_checkpoint)
             if setup_args.config_file_type == ConfigFileType.MODULE:
                 config = None
             else:
                 model_dict = setup_args.load_model_config_dict()
+                tokenizer_cfg = model_dict["config"]["vlm_config"]["tokenizer"]
+                has_bundled_processor = _checkpoint_has_processor_files(checkpoint_path)
                 if setup_args.vlm_processor_from_checkpoint:
                     # Source the VLM processor from the loaded checkpoint's own
                     # bundled files instead of the repository hardcoded in the
                     # model config. Drops the redundant base-model download.
-                    tokenizer_cfg = model_dict["config"]["vlm_config"]["tokenizer"]
-                    tokenizer_cfg.pop("repository", None)
-                    tokenizer_cfg.pop("revision", None)
-                    tokenizer_cfg.pop("subdir", None)
-                    tokenizer_cfg["tokenizer_type"] = str(checkpoint_path)
+                    processor_path = checkpoint_path
+                elif has_bundled_processor and _bundled_processor_serves_node(tokenizer_cfg, checkpoint_path):
+                    # Local-first: exported checkpoints bundle processor/tokenizer
+                    # files at their root (export_model); prefer them over the
+                    # repository hardcoded in the model config so exported dirs
+                    # stay offline-capable. Gated on the bundle actually being
+                    # dispatchable for this tokenizer node.
+                    log.info(f"VLM processor: using checkpoint-bundled processor files at {checkpoint_path}")
+                    processor_path = checkpoint_path
+                else:
+                    if has_bundled_processor:
+                        log.info(
+                            f"VLM processor: checkpoint-bundled files at {checkpoint_path} cannot serve this "
+                            "tokenizer config; falling back to the configured source"
+                        )
+                    if repository := tokenizer_cfg.get("repository"):
+                        revision = tokenizer_cfg.get("revision")
+                        if revision is None:
+                            raise ValueError("VLM processor 'revision' is required when 'repository' is set")
+                        processor_path = _download_on_rank0(
+                            CheckpointDirHf(
+                                repository=repository,
+                                revision=revision,
+                                subdirectory=tokenizer_cfg.get("subdir", ""),
+                                include=_PROCESSOR_HF_INCLUDE,
+                            ).download
+                        )
+                    else:
+                        processor_path = None
+                if processor_path is not None and not _point_tokenizer_node_at_dir(tokenizer_cfg, processor_path):
+                    log.info(
+                        "VLM processor: unrecognized 'vlm_config.tokenizer' node shape; leaving the configured "
+                        "tokenizer source untouched"
+                    )
+                # AVAE source: the configured ``avae_path`` when set, else the loaded
+                # checkpoint's bundled ``sound_tokenizer/``. The inference-only
+                # ``from_checkpoint`` key (default False) forces bundled; pop it so it
+                # never reaches AVAEInterface.
+                sound_cfg = model_dict["config"].get("sound_tokenizer")
+                if sound_cfg is not None:
+                    from_checkpoint = sound_cfg.pop("from_checkpoint", False)
+                    sound_tokenizer_dir = Path(checkpoint_path) / "sound_tokenizer"
+                    if sound_tokenizer_dir.is_dir() and (from_checkpoint or not sound_cfg.get("avae_path")):
+                        from cosmos_framework.inference.common.checkpoints import (
+                            _AVAE_LEGACY_CKPT_NAME,
+                            _materialize_avae_ckpt,
+                        )
+
+                        _materialize_avae_ckpt(str(sound_tokenizer_dir))
+                        sound_cfg["bucket_name"] = ""
+                        sound_cfg["avae_path"] = str(sound_tokenizer_dir / _AVAE_LEGACY_CKPT_NAME)
                 config = Cosmos3OmniConfig(model=model_dict)
             model = Cosmos3OmniModel.from_pretrained_dcp(
                 checkpoint_path,
                 config=config,
                 parallelism_config=parallelism_config,
                 compile_config=compile_config,
+                quantization_config=quantization_config,
             ).model
             if model.config.rectified_flow_inference_config.scheduler_type != sampler_override:
                 model.config.rectified_flow_inference_config.scheduler_type = sampler_override
@@ -1072,7 +1294,10 @@ class OmniInference(Inference):
                 log.debug(f"Sampler overridden to: {sampler_override}")
 
         vae_decode_stream: torch.cuda.Stream | None = None
-        if setup_args.use_separate_pipeline_vision_decode_gpu:
+        vision_tokenizer = model.tokenizer_vision_gen
+        if setup_args.use_separate_pipeline_vision_decode_gpu and vision_tokenizer is None:
+            log.info("Separate vision decode GPU setup skipped because the generation vision tokenizer is not loaded")
+        elif setup_args.use_separate_pipeline_vision_decode_gpu:
             # The CP/CFGP ranks are partitioned into replica-local groups of size
             # cp_size * cfgp_size. Only the first rank in each group owns separate-VAE
             # decode work. For example, with cp_size=2 and cfgp_size=1, ranks [0,1]
@@ -1092,7 +1317,7 @@ class OmniInference(Inference):
                 vae_device = torch.device("cuda", vae_device_index)
                 inference_device = torch.device("cuda", torch.cuda.current_device())
                 vae_decode_stream = torch.cuda.Stream(device=vae_device)
-                vae = model.tokenizer_vision_gen.model
+                vae = vision_tokenizer.model
                 vae.device = str(vae_device)
                 vae.model = vae.model.to(device=vae_device)
                 vae.scale = tree_map_only(torch.Tensor, lambda tensor: tensor.to(device=vae_device), vae.scale)
@@ -1263,20 +1488,30 @@ class OmniInference(Inference):
     @torch.no_grad()
     @override
     def generate_batch(
-        self, sample_args_list: Sequence[SampleArgs], data_batch: dict[str, Any], *, warmup: bool = False
+        self,
+        sample_args_list: Sequence[SampleArgs],
+        data_batch: dict[str, Any],
+        *,
+        save_outputs: bool = True,
     ) -> list[SampleOutputs]:
         assert all(isinstance(sa, OmniSampleArgs) for sa in sample_args_list)
+
+        transfer_flags = [bool(sa.transfer_hints) for sa in sample_args_list]
+        if any(transfer_flags):
+            assert all(transfer_flags), "Cannot mix transfer and non-transfer samples in a batch"
+            assert len(sample_args_list) == 1, "Batching is not supported for transfer inference"
+            return self._generate_transfer_batch(sample_args_list[0], save_outputs=save_outputs)
 
         reasoner_flags = [cast(OmniSampleArgs, sa).model_mode.is_reasoner for sa in sample_args_list]
         if any(reasoner_flags):
             assert all(reasoner_flags), "Cannot mix reasoner and non-reasoner samples in a batch"
-            return self._generate_reasoner_batch(sample_args_list, data_batch, warmup=warmup)
+            return self._generate_reasoner_batch(sample_args_list, data_batch, save_outputs=save_outputs)
 
         # Process inputs
         try:
-            with sync_distributed_errors():
+            with self._get_timer(f"{self.__class__.__name__}.prepare_inputs"), sync_distributed_errors():
                 for sample_args in sample_args_list:
-                    if self.should_process_sample(sample_args) and not warmup:
+                    if self.should_process_sample(sample_args) and save_outputs:
                         log.debug(f"{sample_args.__class__.__name__}({sample_args})")
                         assert sample_args.output_dir is not None
                         sample_args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1289,10 +1524,10 @@ class OmniInference(Inference):
                     data_batch=data_batch, batch_size=len(sample_args_list), model=self.model
                 )
         except Exception as e:
+            # Apply the same error policy to warmup and measured passes:
+            # fail fast unless keep_going is enabled.
             return [
-                self._handle_sample_exception(args, e)
-                for args in sample_args_list
-                if self.should_process_sample(args) and not warmup
+                self._handle_sample_exception(args, e) for args in sample_args_list if self.should_process_sample(args)
             ]
 
         # Generate samples
@@ -1354,7 +1589,6 @@ class OmniInference(Inference):
         # denoising loop produces corrupt outputs.
         seed = [sa.seed if sa.seed is not None else _fallback_seed(cast(OmniSampleArgs, sa)) for sa in sample_args_list]
         outputs: dict[str, Any] | None = None
-
 
         if outputs is None:
             assert all(sa.num_outputs == 1 for sa in sample_args_list), "num_outputs must be 1"
@@ -1434,9 +1668,7 @@ class OmniInference(Inference):
                         "(one must divide the other). Non-nesting CP/CFGP overlays "
                         "with divergent per-sample num_steps are unsupported."
                     )
-                _steps_t = torch.tensor(
-                    [local_num_steps], device=self.model.tensor_kwargs["device"], dtype=torch.int32
-                )
+                _steps_t = torch.tensor([local_num_steps], device=self.model.tensor_kwargs["device"], dtype=torch.int32)
                 torch.distributed.all_reduce(
                     _steps_t, op=torch.distributed.ReduceOp.MAX, group=parallel_dims.dp_shard_mesh.get_group()
                 )
@@ -1481,7 +1713,7 @@ class OmniInference(Inference):
             with self._get_timer(f"{self.model.__class__.__name__}.decode_sound"):
                 outputs["sound"] = [self.model.decode_sound(sound) for sound in outputs.pop("sound")]
 
-        if warmup:
+        if not save_outputs:
             return []
 
         # Save outputs
@@ -1564,12 +1796,85 @@ class OmniInference(Inference):
         return sample_outputs
 
     @torch.no_grad()
+    def _generate_transfer_batch(
+        self,
+        sample_args: OmniSampleArgs,
+        *,
+        save_outputs: bool = True,
+    ) -> list[SampleOutputs]:
+        """Handle transfer inference using the autoregressive generate_transfer_sample path."""
+        from cosmos_framework.inference.transfer import generate_transfer_sample
+
+        try:
+            with sync_distributed_errors():
+                if self.should_process_sample(sample_args) and save_outputs:
+                    log.debug(f"{sample_args.__class__.__name__}({sample_args})")
+                    assert sample_args.output_dir is not None
+                    sample_args.output_dir.mkdir(parents=True, exist_ok=True)
+                    sample_args_file = sample_args.output_dir / "sample_args.json"
+                    sample_args_file.write_text(sample_args.model_dump_json())
+                    log.info(f"Saved sample args to '{sample_args_file}'", rank0_only=False)
+        except Exception as e:
+            if self.should_process_sample(sample_args):
+                return [self._handle_sample_exception(sample_args, e)]
+            return []
+
+        transfer_output = generate_transfer_sample(sample_args=sample_args, model=self.model)
+
+        if not save_outputs:
+            return []
+
+        sample_outputs: list[SampleOutputs] = []
+        try:
+            with sync_distributed_errors():
+                if self.should_process_sample(sample_args):
+                    assert sample_args.output_dir is not None
+                    content: dict[str, Any] = {}
+                    files: list[Path] = []
+
+                    vision_cthw = ((1.0 + transfer_output.output_video.squeeze(0)) / 2).clamp(0, 1)
+
+                    if vision_cthw.shape[1] == 1:
+                        quality = sample_args.image_save_quality
+                    else:
+                        quality = sample_args.video_save_quality
+                    vision_file = sample_args.output_dir / f"vision{sample_args.vision_extension}"
+                    output_fps = transfer_output.fps
+                    save_img_or_video(vision_cthw, str(vision_file.with_suffix("")), fps=output_fps, quality=quality)
+                    assert vision_file.is_file(), vision_file
+                    files.append(vision_file)
+
+                    for hint_key, control_video in transfer_output.control_videos.items():
+                        control_cthw = ((1.0 + control_video.squeeze(0)) / 2).clamp(0, 1)
+                        control_file = sample_args.output_dir / f"control_{hint_key}{sample_args.vision_extension}"
+                        save_img_or_video(
+                            control_cthw, str(control_file.with_suffix("")), fps=output_fps, quality=quality
+                        )
+                        files.append(control_file)
+                        log.info(f"Saved control video to '{control_file}'", rank0_only=False)
+
+                    sample_output = SampleOutputs(
+                        args=sample_args.model_dump(mode="json"),
+                        outputs=[SampleOutput(content=content, files=files)],
+                    )
+                    sample_outputs_file = sample_args.output_dir / "sample_outputs.json"
+                    sample_outputs_file.write_text(sample_output.model_dump_json())
+                    log.success(f"Saved transfer outputs to '{sample_outputs_file}'", rank0_only=False)
+
+                    sample_outputs.append(sample_output)
+
+        except Exception as e:
+            return [self._handle_sample_exception(sample_args, e)] if self.should_process_sample(sample_args) else []
+
+        return sample_outputs
+
+    @torch.no_grad()
     def _generate_reasoner_batch(
         self,
         sample_args_list: Sequence[SampleArgs],
         data_batch: dict[str, Any],
         *,
-        warmup: bool = False,
+        save_outputs: bool = True,
     ) -> list[SampleOutputs]:
         """Reasoner AR text generation. Each prompt writes ``reasoner_text.txt`` and
         ``SampleOutput.content["reasoner_text"]``. Mixing image-conditioned and
@@ -1578,29 +1883,38 @@ class OmniInference(Inference):
 
         prompts: list[str] = data_batch[self.model.input_caption_key]
         raw_images: list[Image.Image | None] = data_batch["reasoner_images"]
-        n_set = sum(img is not None for img in raw_images)
-        if 0 < n_set < len(raw_images):
+        raw_videos: list[dict[str, Any] | None] | None = data_batch.get("reasoner_videos")
+
+        n_img = sum(img is not None for img in raw_images)
+        n_vid = sum(v is not None for v in (raw_videos or []))
+        if n_img and n_vid:
+            raise ValueError("Reasoner batch mixes image- and video-conditioned samples. Split into separate batches.")
+        if 0 < n_img < len(raw_images):
             raise ValueError(
                 "Reasoner batch mixes image-conditioned and text-only samples "
-                f"({n_set}/{len(raw_images)} have vision_path). Split into separate batches."
+                f"({n_img}/{len(raw_images)} have an image vision_path). Split into separate batches."
             )
-        images: list[Image.Image] | None = cast(list[Image.Image], raw_images) if n_set == len(raw_images) else None
+        if raw_videos is not None and 0 < n_vid < len(raw_videos):
+            raise ValueError(
+                "Reasoner batch mixes video-conditioned and text-only samples "
+                f"({n_vid}/{len(raw_videos)} have a video vision_path). Split into separate batches."
+            )
+        images: list[Image.Image] | None = cast(list[Image.Image], raw_images) if n_img == len(raw_images) else None
+        videos: list[dict[str, Any]] | None = (
+            cast(list[dict[str, Any]], raw_videos) if raw_videos is not None and n_vid == len(raw_videos) else None
+        )
 
         try:
             with sync_distributed_errors():
                 for sa, prompt in zip(sample_args_list, prompts):
-                    if self.should_process_sample(sa) and not warmup:
+                    if self.should_process_sample(sa) and save_outputs:
                         log.debug(f"{sa.__class__.__name__}({sa})")
                         assert sa.output_dir is not None
                         sa.output_dir.mkdir(parents=True, exist_ok=True)
                         (sa.output_dir / "sample_args.json").write_text(sa.model_dump_json())
                         self._run_text_guardrail(str(sa.output_dir), prompt)
         except Exception as e:
-            return [
-                self._handle_sample_exception(sa, e)
-                for sa in sample_args_list
-                if self.should_process_sample(sa) and not warmup
-            ]
+            return [self._handle_sample_exception(sa, e) for sa in sample_args_list if self.should_process_sample(sa)]
 
         # Collective call: every rank must enter so FSDP unshard/reshard and the
         # cross-rank early-exit reduction stay in lockstep. Not wrapped in try/except.
@@ -1609,6 +1923,7 @@ class OmniInference(Inference):
                 prompts,
                 max_new_tokens=sample_args_list[0].max_new_tokens,
                 images=images,
+                videos=videos,
                 do_sample=sample_args_list[0].do_sample,
                 temperature=sample_args_list[0].temperature,
                 top_k=sample_args_list[0].top_k,
@@ -1618,7 +1933,7 @@ class OmniInference(Inference):
                 seed=sample_args_list[0].seed,
             )
 
-        if warmup:
+        if not save_outputs:
             return []
 
         sample_outputs: list[SampleOutputs] = []

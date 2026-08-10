@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import sys
 import time
 from typing import Any, Dict, Optional, Type, TypeVar, Union
 
@@ -271,6 +272,17 @@ class CheckpointConfig:
     # for dcp, whether to use async mode
     dcp_async_mode_enabled: bool = False
 
+    # For dcp load, whether to deduplicate redundant storage reads of replicated state and
+    # broadcast the data over the (NCCL) device mesh instead. Two replication patterns waste
+    # reads at large world sizes: (1) fully-replicated entries (e.g. optimizer scalar `step`
+    # tensors) are saved on global rank 0 yet read by *every* rank — a single-object S3 hotspot;
+    # (2) sharded DTensors are byte-identical across their mesh's replicate dims (e.g. HSDP's
+    # `dp_replicate`), so each shard file is read by `dp_replicate` ranks. When enabled, each leaf
+    # is read by exactly one rank — global rank 0 for fully-replicated non-DTensor leaves, and
+    # local rank 0 along the DTensor's own replicate mesh dims otherwise — then broadcast to the
+    # rest, cutting reads from O(world_size) to O(dp_shard).
+    dcp_load_dedup: bool = False
+
     # Configs for saving the checkpoints to object store.
     save_to_object_store: ObjectStoreConfig = attrs.field(factory=ObjectStoreConfig)
 
@@ -346,7 +358,7 @@ class NVTXConfig:
 @make_freezable
 @attrs.define(slots=False)
 class StragglerDetectionConfig:
-    """Config for the Straggler detection tool."""
+    """Config for Straggler detection tool: https://invalid_url"""
 
     # Enable the Straggler Detection.
     enabled: bool = False
@@ -381,8 +393,10 @@ class Profiling:
     enable_memory_snapshot: bool = False
     save_s3: bool = False
     profile_freq: int = 1
-    # Number of warmup iterations before the active profile iteration.
+    # Number of warmup iterations before the active profile iterations.
     profile_warmup: int = 3
+    # Number of consecutive active iterations to capture in one trace.
+    profile_active: int = 1
     # Target ranks for profiling, each entry must be >=0 and < world_size.
     target_ranks: list[int] = list(range(8))
     # The options below apply only to the torch profiler (enable_profiling).
@@ -424,6 +438,11 @@ class TrainerConfig:
 
     # distributed parallelism strategy
     distributed_parallelism: str = "ddp"
+    # For large tensors in the input training data, when broadcasting to CP peer ranks, it is better
+    # to broadcast them directly to avoid the memory explosion with pickling, which happens when
+    # calling torch.distributed.broadcast_object_list.
+    # Setting a threshold value lower than `sys.maxsize` will enable this optimization.
+    cp_input_direct_broadcast_min_bytes: int = sys.maxsize
     # Distributed data parallel configs.
     ddp: DDPConfig = attrs.field(factory=DDPConfig)
     # cuDNN configs.
@@ -512,76 +531,19 @@ class Config:
         distributed.broadcast(job_name_tensor, 0)
         self.job.name = job_name_tensor.cpu().numpy().tobytes().decode("utf-8")
 
-
         assert self.job.project != ""
         assert self.job.group != ""
         assert self.job.name != ""
 
 
-def _reload_make_config_for_registrations(root_cfg: "Config") -> None:
-    """Run ``make_config()`` once for import-time registrations (same intent as loading ``config.py``).
-
-    Deserialized YAML/TOML instantiates attrs ``Config`` with ``__class__.__module__`` set to the
-    module that defines the class (often ``…defaults.config``). ``load_callable`` splits on the
-    last dot, which turns that into ``import …defaults`` + ``getattr(..., "config")`` — the
-    ``defaults.config`` submodule, which often has no ``make_config``. The entrypoint with
-    ``make_config`` is typically the sibling module ``….config``.
-    """
-    from cosmos_framework.utils.serialization import load_callable
-
-    cls_mod = type(root_cfg).__module__
-
-    def _try_make_config(mod: object) -> bool:
-        mk = getattr(mod, "make_config", None)
-        if mk is None:
-            return False
-        _ = mk()
-        return True
-
-    if cls_mod.endswith(".defaults.config"):
-        sibling = cls_mod[: -len(".defaults.config")] + ".config"
-        try:
-            if _try_make_config(importlib.import_module(sibling)):
-                return
-        except ModuleNotFoundError:
-            pass
-
-    try:
-        if _try_make_config(load_callable(cls_mod)):
-            return
-    except (AssertionError, AttributeError, ModuleNotFoundError):
-        pass
-
-    try:
-        if _try_make_config(importlib.import_module(cls_mod)):
-            return
-    except ModuleNotFoundError:
-        pass
-
-    raise AttributeError(
-        f"No make_config() found for Config class module {cls_mod!r}. "
-        "YAML/TOML export must match a tree whose Python package exposes make_config "
-        "(e.g. cosmos_framework.configs.base.vlm.config next to cosmos_framework.configs.base.vlm.defaults.config)."
-    )
-
-
 def load_config(config_path: str, opts: list[str], enable_one_logger: bool = False) -> Config:
-    from cosmos_framework.utils.serialization import from_toml, from_yaml
+    from cosmos_framework.utils.serialization import from_yaml, load_callable
 
     t1 = time.monotonic_ns()
     if config_path.endswith(".yaml"):
         config = from_yaml(config_path)
-        # Import-time registrations (dataloaders, experiments, …): YAML root class
-        # typically lives in …defaults.config; make_config() is on sibling …config.
-        _reload_make_config_for_registrations(config)
-
-        from cosmos_framework.utils.config_helper import override
-
-        config = override(config, opts, remove_defaults=True)
-    elif config_path.endswith(".toml"):
-        config = from_toml(config_path)
-        # TOML is the same exported structured schema as YAML.
-        _reload_make_config_for_registrations(config)
+        # for registration of dataloaders, etc.
+        _ = load_callable(config.__module__).make_config()
 
         from cosmos_framework.utils.config_helper import override
 
@@ -607,7 +569,7 @@ def load_config(config_path: str, opts: list[str], enable_one_logger: bool = Fal
 
 
 def _load_py_config(config_path: str, opts: list[str], validate: bool = True) -> Config:
-
+    # NOTE: circular dependency
     from cosmos_framework.utils.config_helper import get_config_module, override
 
     t1 = time.monotonic_ns()

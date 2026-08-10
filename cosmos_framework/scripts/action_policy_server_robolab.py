@@ -25,6 +25,7 @@ from cosmos_framework.inference.common.init import init_script
 
 init_script()
 
+import json
 import socket
 import threading
 from dataclasses import dataclass
@@ -37,15 +38,15 @@ import torch
 import torch.nn.functional as F
 import tyro
 
-from cosmos_framework.data.vfm.action.domain_utils import get_domain_id
-from cosmos_framework.data.vfm.action.pose_utils import (
+from cosmos_framework.data.generator.action.domain_utils import get_domain_id
+from cosmos_framework.data.generator.action.pose_utils import (
     build_abs_pose_from_components,
     convert_rotation,
     pose_abs_to_rel,
     pose_rel_to_abs,
 )
-from cosmos_framework.data.vfm.action.transforms import ActionTransformPipeline
-from cosmos_framework.data.vfm.joint_dataloader import IterativeJointDataLoader
+from cosmos_framework.data.generator.action.transforms import ActionTransformPipeline
+from cosmos_framework.data.generator.joint_dataloader import IterativeJointDataLoader
 from cosmos_framework.inference.args import OmniSetupArgs, OmniSetupOverrides
 from cosmos_framework.inference.common.args import ConfigFileType, ConfigOverrides, tyro_cli
 from cosmos_framework.inference.common.config import deserialize_config, deserialize_config_dict, load_config
@@ -77,6 +78,8 @@ _DEFAULT_HF_REVISION = "main"
 _ROBOLAB_POLICY_HF_REPOSITORIES = {
     "Cosmos3-Nano-Policy-DROID": "nvidia/Cosmos3-Nano-Policy-DROID",
     "nvidia/Cosmos3-Nano-Policy-DROID": "nvidia/Cosmos3-Nano-Policy-DROID",
+    "Cosmos3-Edge-Policy-DROID": "nvidia/Cosmos3-Edge-Policy-DROID",
+    "nvidia/Cosmos3-Edge-Policy-DROID": "nvidia/Cosmos3-Edge-Policy-DROID",
 }
 
 ActionSpace = Literal["joint_pos", "midtrain"]
@@ -352,6 +355,8 @@ class RobolabServerArgs(pydantic.BaseModel):
     """Whether the first action row contains the current state."""
     history_length: int = 1
     """State/history action rows to trim from the generated action output."""
+    format_prompt_as_json: bool | None = None
+    """Serve prompts as structured JSON (matching training ``format_prompt_as_json``)."""
 
 
 class RobolabPolicyService:
@@ -453,9 +458,17 @@ class RobolabPolicyService:
 
         if dataset_config is None or dataset_entry is None:
             log.warning(
-                "[robolab-policy-server] no training action dataset config found; using default ActionTransformPipeline"
+                "[robolab-policy-server] no training action dataset config found; using default "
+                f"ActionTransformPipeline (format_prompt_as_json={bool(args.format_prompt_as_json)})"
             )
-            return ActionTransformPipeline(max_action_dim=max_action_dim, cfg_dropout_rate=0.0), inferred
+            return (
+                ActionTransformPipeline(
+                    max_action_dim=max_action_dim,
+                    cfg_dropout_rate=0.0,
+                    format_prompt_as_json=bool(args.format_prompt_as_json),
+                ),
+                inferred,
+            )
 
         if action_dataset_config is not None:
             chunk_length = getattr(action_dataset_config, "chunk_length", None)
@@ -478,6 +491,9 @@ class RobolabPolicyService:
             dataset_config.cfg_dropout_rate = 0.0
 
         dataset_entry.dataset = {"_target_": f"{__name__}._DummyDataset"}
+
+        if args.format_prompt_as_json is not None:
+            dataset_config.format_prompt_as_json = bool(args.format_prompt_as_json)
 
         wrapped_dataset = instantiate(dataset_config)
         return wrapped_dataset.transform, inferred
@@ -545,14 +561,17 @@ class RobolabPolicyService:
             "video": video,
             "action": action,
             "conditioning_fps": torch.tensor(self.cfg.conditioning_fps, dtype=torch.long),  # []
-            "mode": "policy",
+            "mode": "wam",
             "domain_id": torch.tensor(get_domain_id(self.cfg.domain_name), dtype=torch.long),  # []
             "viewpoint": "concat_view",
             "additional_view_description": _CONCAT_VIEW_DESCRIPTION,
         }
         if history_action is not None:
             sample["history_action"] = history_action
-        return self._transform(sample, self.cfg.resolution)
+        sample = self._transform(sample, self.cfg.resolution)
+        if isinstance(sample.get("ai_caption"), dict):
+            sample["ai_caption"] = json.dumps(sample["ai_caption"])
+        return sample
 
     def infer(self, obs: dict[str, Any]) -> dict[str, Any]:
         sample = self._build_sample(obs)

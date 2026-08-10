@@ -11,11 +11,19 @@ Only safe to import when FLASH3_SUPPORTED is True.
 
 import inspect
 
+import torch
+
 # pyrefly: ignore  # missing-import
 from flash_attn_3_nv.flash_attn_interface import flash_attn_func, flash_attn_varlen_func
 from torch import Tensor
 
+# Treat the Flash-Attn entrypoints as opaque leaves for TorchDynamo. They wrap a Python
+# ``autograd.Function`` (``FlashAttnVarlenFunc``/``FlashAttnFunc``); when Dynamo tries to
+# trace into ``.apply``.
+torch._dynamo.allow_in_graph(flash_attn_func)
+torch._dynamo.allow_in_graph(flash_attn_varlen_func)
 
+# NOTE: older commits didn't have `return_attn_probs` as an argument, and there is no
 # reflection of the commit hash in the version, so we have to manually inspect the signatures
 HAS_RETURN_ATTN_PROBS = "return_attn_probs" in inspect.signature(flash_attn_func).parameters
 
@@ -190,7 +198,7 @@ def flash3_attention(
     assert output.dim() == 4  # [B,N,H,Dv] or [1,total_tokens,H,Dv]
     assert lse.dim() == 3  # [B,H,N] or [1,H,total_tokens]
 
-
+    # NOTE: Do NOT call .contiguous on LSE, otherwise Attention Merging backward pass will be
     # incorrect. All output and lse tensors passed into `merge_attentions` must have the same data
     # pointer as their corresponding attention autograd ops!
     lse = lse.permute(0, 2, 1)  # [B,N,H] or [1,total_tokens,H]
