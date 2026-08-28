@@ -1180,6 +1180,9 @@ class OmniInference(Inference):
         parallelism_config = cls._get_parallelism_config(setup_args)
         compile_config = cls._get_compile_config(setup_args)
         quantization_config = cls._get_quantization_config(setup_args)
+
+        print("setup_args:", setup_args, flush=True)
+        
         if setup_args.checkpoint_type == CheckpointType.DCP and setup_args.config_file_type == ConfigFileType.MODULE:
             from cosmos_framework.inference.common.config import save_config
             from cosmos_framework.utils.generator.model_loader import load_model_from_checkpoint

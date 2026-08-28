@@ -1,0 +1,16 @@
+{
+  "action_chunk_size": 60,
+  "action_path": "/mnt/ws_nas/wzj/cosmos-framework/datasets/action/av_480_20260501_7.json",
+  "domain_name": "av",
+  "extra": {
+    "golden_psnr_min": 14.0
+  },
+  "fps": 10,
+  "image_size": 480,
+  "view_point": "ego_view",
+  "model_mode": "forward_dynamics",
+  "name": "test_av_action",
+  "prompt": "You are an autonomous vehicle planning system.",
+  "seed": 0,
+  "vision_path": "/mnt/ws_nas/wzj/cosmos-framework/datasets/action/real_case/0_3.mp4"
+}

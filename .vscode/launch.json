@@ -1,0 +1,31 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Cosmos3 Edge Inference",
+            "type": "python",
+            "request": "launch",
+            "python": "/opt/anaconda3/envs/cosmos/bin/python",
+            "module": "cosmos_framework.scripts.inference",
+            "cwd": "/mnt/ws_nas/wzj/cosmos-framework",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "HF_TOKEN": "${env:HF_TOKEN}",
+                "HF_HOME": "/mnt/ws_nas/hf_cache",
+                "HF_HUB_OFFLINE": "1",
+                "CUDA_VISIBLE_DEVICES": "1",
+                "PYTHONUNBUFFERED": "1",
+                "HYDRA_FULL_ERROR": "1"
+            },
+            "args": [
+                "-i",
+                "inputs/omni/action_forward_dynamics_av_local.json",
+                "-o",
+                "outputs/fd_av",
+                "--checkpoint-path",
+                "/mnt/ws_nas/wzj/cosmos-framework/checkpoints/Cosmos3-Nano"
+            ]
+        }
+    ]
+}
