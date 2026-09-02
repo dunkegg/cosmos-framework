@@ -22,6 +22,8 @@ from torch.utils.data import Dataset, IterableDataset, get_worker_info
 from cosmos_framework.data.generator.action.datasets.droid_merged_lerobot_dataset import DROIDMergedLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.droid_lerobot_dataset import DROIDLeRobotDataset
 from cosmos_framework.data.generator.action.datasets.libero_lerobot_dataset import LIBEROLeRobotDataset
+from cosmos_framework.data.generator.action.datasets.r2r_lerobot_dataset import R2RLeRobotDataset
+
 from cosmos_framework.data.generator.action.transforms import ActionTransformPipeline
 
 
@@ -279,4 +281,60 @@ def get_action_libero_sft_dataset(
     sft = ActionSFTDataset(dataset, transform, resolution)
     if iterable_shuffle:
         return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
+    return sft
+
+
+def get_action_r2r_lerobot_sft_dataset(
+    *,
+    root: str,
+    fps: float = 10.0,
+    chunk_length: int = 60,
+    mode: str = "forward_dynamics",
+    action_normalization: str | None = None,
+    viewpoint: str = "ego_view",
+    split: str = "train",
+    use_image_augmentation: bool = False,
+    resolution: str | int = "480",
+    max_action_dim: int = 64,
+    tokenizer_config: dict | None = None,
+    cfg_dropout_rate: float = 0.1,
+    append_viewpoint_info: bool = True,
+    append_duration_fps_timestamps: bool = True,
+    append_resolution_info: bool = True,
+    append_idle_frames: bool = False,
+    idle_frames_dropout: float = 0.05,
+    format_prompt_as_json: bool = True,
+    iterable_shuffle: bool = False,
+    episode_shuffle_seed: int = 42,
+) -> Dataset:
+    """Build the R2R indoor-navigation forward-dynamics SFT dataset."""
+
+    dataset = R2RLeRobotDataset(
+        root=root,
+        fps=fps,
+        chunk_length=chunk_length,
+        split=split,
+        mode=mode,
+        viewpoint=viewpoint,
+        action_normalization=action_normalization,
+        use_image_augmentation=use_image_augmentation,
+    )
+
+    transform = ActionTransformPipeline(
+        tokenizer_config=tokenizer_config,
+        cfg_dropout_rate=cfg_dropout_rate,
+        max_action_dim=max_action_dim,
+        append_viewpoint_info=append_viewpoint_info,
+        append_duration_fps_timestamps=append_duration_fps_timestamps,
+        append_resolution_info=append_resolution_info,
+        append_idle_frames=append_idle_frames,
+        idle_frames_dropout=idle_frames_dropout,
+        format_prompt_as_json=format_prompt_as_json,
+    )
+
+    sft = ActionSFTDataset(dataset, transform, resolution)
+
+    if iterable_shuffle:
+        return ActionIterableShuffleDataset(sft, seed=episode_shuffle_seed)
+
     return sft

@@ -63,7 +63,13 @@ def convert_model_to_dcp(args: Args):
     hf_path = checkpoint_config.download_checkpoint()
     _redirect_avae_to_local(hf_path)
     model_dict = checkpoint_config.load_model_config_dict()
-    hf_config = Cosmos3OmniConfig(model=build_public_model_config(model_dict))
+    #wzj delete sound ckpt
+    public_model_config = build_public_model_config(model_dict)
+
+    public_model_config["config"]["sound_gen"] = False
+    public_model_config["config"]["sound_tokenizer"] = None
+
+    hf_config = Cosmos3OmniConfig(model=public_model_config)
     hf_model = Cosmos3OmniModel.from_pretrained_dcp(hf_path, config=hf_config)
     state_dict = get_model_state_dict(hf_model.model)
 
