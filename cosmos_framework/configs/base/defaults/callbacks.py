@@ -125,11 +125,11 @@ JOB_MONITOR_CALLBACKS = dict(
         update_interval_in_minute=20,
         save_s3="${upload_reproducible_setup}",
     ),
-    device_monitor=L(DeviceMonitor)(
-        every_n=200,
-        save_s3="${upload_reproducible_setup}",
-        upload_every_n_mul=5,
-    ),
+    # device_monitor=L(DeviceMonitor)(
+    #     every_n=200,
+    #     save_s3="${upload_reproducible_setup}",
+    #     upload_every_n_mul=5,
+    # ),wzj debug 
     termination_signal_checkpoint=L(TerminationSignalCheckpoint)(
         min_save_fraction=1 / 3,
     ),

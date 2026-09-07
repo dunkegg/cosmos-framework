@@ -51,6 +51,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+wzj_train_output/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -220,3 +221,5 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 .env
+
+

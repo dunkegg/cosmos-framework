@@ -66,7 +66,7 @@ class R2RLeRobotDataset(BaseActionLeRobotDataset):
         action_normalization: ActionNormalization | None = None,
         use_image_augmentation: bool = False,
         parquet_cache_size: int = 32,
-        caption_fallback: str = "Navigate according to the given trajectory.",
+        caption_fallback: str = "You are an autonomous vehicle planning system.",
     ) -> None:
         super().__init__(
             fps=fps,

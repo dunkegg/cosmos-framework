@@ -23,8 +23,8 @@ def _make_model_config() -> dict:
     cfg["sound_gen"] = False
     cfg["sound_dim"] = 64
     cfg["sound_latent_fps"] = 25
-    cfg["max_num_tokens_after_packing"] = 74000
-    cfg["resolution"] = "720"
+    cfg["max_num_tokens_after_packing"] = -1
+    cfg["resolution"] = "480"
     cfg["activation_checkpointing"]["mode"] = "selective"
 
     cfg["tokenizer"]["encode_exact_durations"] = [61]
@@ -46,6 +46,9 @@ def _make_model_config() -> dict:
         train_time_weight="uniform",
         use_discrete_rf=False,
     )
+    cfg["vlm_config"]["tokenizer"]["pretrained_model_name"] = \
+        "/mnt/nas/hf_cache/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b"
+    
     return cfg
 
 
@@ -69,7 +72,7 @@ action_fd_r2r_posttrain = LazyDict(
         job=dict(
             project="cosmos3_action_fd",
             group="action_sft",
-            name="${now:%Y-%m-%d_%H-%M-%S}_action_fd_droid_posttrain",
+            name="${now:%Y-%m-%d_%H-%M-%S}_action_fd_r2r_posttrain",
             wandb_mode="disabled",
         ),
         model=dict(
@@ -80,10 +83,10 @@ action_fd_r2r_posttrain = LazyDict(
             eps=1.0e-08,
             fused=True,
             keys_to_select=[
-                "moe_gen",
-                "time_embedder",
-                "vae2llm",
-                "llm2vae",
+                # "moe_gen",
+                # "time_embedder",
+                # "vae2llm",
+                # "llm2vae",
                 "action2llm",
                 "llm2action",
                 "action_modality_embed",
@@ -95,6 +98,7 @@ action_fd_r2r_posttrain = LazyDict(
                 "action_modality_embed": 5.0,
             },
             optimizer_type="FusedAdam",
+            # optimizer_type="AdamW",
             weight_decay=0.05,
         ),
         scheduler=dict(
@@ -122,10 +126,10 @@ action_fd_r2r_posttrain = LazyDict(
             cudnn=dict(benchmark=True, deterministic=False),
             ddp=dict(broadcast_buffers=True, find_unused_parameters=False, static_graph=True),
             grad_scaler_args=dict(enabled=False),
-            straggler_detection=dict(enabled=True, report_freq=50),
+            straggler_detection=dict(enabled=False, report_freq=50),
             callbacks=dict(
                 dataloader_speed=dict(every_n=100, save_s3=False, step_size=1),
-                device_monitor=dict(every_n=200, log_memory_detail=True, save_s3=False, step_size=1),
+                # device_monitor=dict(every_n=200, log_memory_detail=True, save_s3=False, step_size=1),
                 grad_clip=dict(clip_norm=1.0, force_finite=True),
                 heart_beat=dict(every_n=200, save_s3=False, step_size=1, update_interval_in_minute=20),
                 iter_speed=dict(every_n=50, hit_thres=50, save_s3=False, save_s3_every_log_n=500),
@@ -136,7 +140,7 @@ action_fd_r2r_posttrain = LazyDict(
                 sigma_loss_analysis=dict(every_n=500, every_n_viz=500, save_s3=False),
                 skip_nan_step=dict(max_consecutive_nan=100),
                 training_stats=dict(log_freq=100),
-                compile_tokenizer=dict(enabled=True, warmup_resolutions=["480"]),
+                compile_tokenizer=dict(enabled=False, warmup_resolutions=["480"]),
             ),
         ),
         checkpoint=dict(
@@ -160,8 +164,9 @@ action_fd_r2r_posttrain = LazyDict(
         dataloader_train=L(PackingDataLoader)(
             audio_sample_rate=48000,
             dataset_name="action_r2r",
-            max_samples_per_batch=None,
-            max_sequence_length="${model.config.max_num_tokens_after_packing}",
+            max_samples_per_batch=1,
+            # max_sequence_length="${model.config.max_num_tokens_after_packing}",
+            max_sequence_length=None,
             patch_spatial="${model.config.diffusion_expert_config.patch_spatial}",
             sound_latent_fps="${model.config.sound_latent_fps}",
             tokenizer_spatial_compression_factor="${model.config.tokenizer.spatial_compression_factor}",
@@ -186,6 +191,21 @@ action_fd_r2r_posttrain = LazyDict(
                             viewpoint="ego_view",
                             action_normalization=None,
                             use_image_augmentation=False,
+
+                            resolution="480",
+                            max_action_dim="${model.config.max_action_dim}",
+                            tokenizer_config="${model.config.vlm_config.tokenizer}",
+
+                            cfg_dropout_rate=0.1,
+                            append_viewpoint_info=True,
+                            append_duration_fps_timestamps=True,
+                            append_resolution_info=True,
+                            append_idle_frames=False,
+                            idle_frames_dropout=0.05,
+                            format_prompt_as_json=True,
+
+                            iterable_shuffle=True,
+                            episode_shuffle_seed=42,
                         ),
                     ),
                 ),

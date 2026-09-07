@@ -17,10 +17,18 @@ import numpy as np
 from loguru import logger as logging
 
 try:
-    # pyrefly: ignore  # import-error
-    import straggler
+    from nvidia_resiliency_ext import straggler
 except ImportError:
-    straggler = None
+    try:
+        import straggler
+    except ImportError:
+        straggler = None
+
+# try:
+#     # pyrefly: ignore  # import-error
+#     import straggler
+# except ImportError:
+#     straggler = None
 import termcolor
 import torch
 from torch.distributed._functional_collectives import AsyncCollectiveTensor

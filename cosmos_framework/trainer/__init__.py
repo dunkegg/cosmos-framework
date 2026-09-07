@@ -261,6 +261,17 @@ class ImaginaireTrainer:
 
         # Initialize the optimizer, scheduler, and grad_scaler.
         self.callbacks.on_optimizer_init_start()
+
+        # if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        #     total = sum(p.numel() for p in model.parameters())
+        #     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        #     print(f"total={total/1e9:.3f}B trainable={trainable/1e9:.3f}B ratio={trainable/total:.4%}")
+
+        #     for name, p in model.named_parameters():
+        #         if p.requires_grad and p.numel() > 10_000_000:
+        #             print(name, p.shape, f"{p.numel()/1e6:.1f}M")
+
+
         optimizer, scheduler = model.init_optimizer_scheduler(self.config.optimizer, self.config.scheduler)
         grad_scaler = torch.amp.GradScaler("cuda", **self.config.trainer.grad_scaler_args)
         self.callbacks.on_optimizer_init_end()
