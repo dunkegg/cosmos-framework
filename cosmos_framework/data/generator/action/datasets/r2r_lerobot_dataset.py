@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import torch
+import json
 
 from cosmos_framework.data.generator.action.datasets.cosmos3_action_lerobot import (
     ActionNormalization,
@@ -100,39 +101,80 @@ class R2RLeRobotDataset(BaseActionLeRobotDataset):
         return 9
 
     def _build_r2r_index(self) -> None:
-        """Build the flat index structures expected by BaseActionLeRobotDataset."""
-        parquet_files = sorted(self.root.glob("data/chunk-*/episode_*.parquet"))
+        """Build index using existing parquet files + episodes.jsonl metadata."""
 
-        if not parquet_files:
-            raise FileNotFoundError(
-                f"No parquet files found under {self.root / 'data'}. "
-                "Expected data/chunk-*/episode_*.parquet"
-            )
+        meta_path = self.root / "meta" / "episodes.jsonl"
 
-        episodes: list[tuple[int, Path, int]] = []
+        if not meta_path.exists():
+            raise FileNotFoundError(f"Episode meta not found: {meta_path}")
+
+        # 先把 metadata 做成 dict
+        meta_by_episode = {}
+
+        with open(meta_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+
+                info = json.loads(line)
+                episode_idx = int(info["episode_index"])
+                meta_by_episode[episode_idx] = info
+
+        # 再以实际存在的 parquet 为准
+        parquet_files = sorted(
+            self.root.glob("data/chunk-*/episode_*.parquet")
+        )
+
+        episodes = []
+
+        skipped_no_meta = 0
 
         for parquet_path in parquet_files:
-            try:
-                episode_idx = int(parquet_path.stem.replace("episode_", ""))
-            except ValueError as exc:
-                raise ValueError(f"Unexpected parquet filename: {parquet_path}") from exc
+            episode_idx = int(
+                parquet_path.stem.replace("episode_", "")
+            )
 
-            df = pd.read_parquet(parquet_path, columns=["local_traj"])
-            num_frames = len(df)
+            info = meta_by_episode.get(episode_idx)
+
+            if info is None:
+                skipped_no_meta += 1
+                continue
+
+            num_frames = int(info["length"])
 
             if num_frames <= self._chunk_length:
                 continue
 
-            episodes.append((episode_idx, parquet_path, num_frames))
+            episodes.append(
+                (
+                    episode_idx,
+                    parquet_path,
+                    num_frames,
+                )
+            )
 
         if not episodes:
             raise RuntimeError(
-                f"No episodes are longer than chunk_length={self._chunk_length}"
+                f"No valid episodes found under {self.root}"
             )
 
+        print(
+            f"[R2R] parquet={len(parquet_files)}, "
+            f"meta={len(meta_by_episode)}, "
+            f"valid={len(episodes)}, "
+            f"no_meta={skipped_no_meta}"
+        )
+
         g = torch.Generator().manual_seed(self._split_seed)
-        order = torch.randperm(len(episodes), generator=g).tolist()
-        num_val = int(round(len(episodes) * self._split_val_ratio))
+        order = torch.randperm(
+            len(episodes),
+            generator=g,
+        ).tolist()
+
+        num_val = int(
+            round(len(episodes) * self._split_val_ratio)
+        )
 
         if self._split == "train":
             selected = order[num_val:]
@@ -147,29 +189,42 @@ class R2RLeRobotDataset(BaseActionLeRobotDataset):
         self._episode_info = {}
 
         for episode_list_idx in selected:
-            episode_idx, parquet_path, num_frames = episodes[episode_list_idx]
-            valid_len = num_frames - self._chunk_length
+            episode_idx, parquet_path, num_frames = (
+                episodes[episode_list_idx]
+            )
+
+            valid_len = (
+                num_frames - self._chunk_length
+            )
 
             if valid_len <= 0:
                 continue
 
+            info = meta_by_episode[episode_idx]
+
             self._episode_info[episode_idx] = {
                 "parquet_path": parquet_path,
                 "num_frames": num_frames,
+                "task": (
+                    info["tasks"][0]
+                    if info.get("tasks")
+                    else self._caption_fallback
+                ),
             }
 
-            # Base _resolve_index() expects:
-            # (dataset_idx, row_start, valid_len, episode_id)
-            # We do not use dataset_idx here. row_start=0 means row_idx is the
-            # episode-local start frame.
-            self._episode_records.append((0, 0, valid_len, episode_idx))
-            self._num_valid_indices += valid_len
-            self._episode_cum_ends.append(self._num_valid_indices)
+            self._episode_records.append(
+                (
+                    0,
+                    0,
+                    valid_len,
+                    episode_idx,
+                )
+            )
 
-        if self._num_valid_indices == 0:
-            raise RuntimeError(
-                f"No valid windows found for split={self._split!r}, "
-                f"chunk_length={self._chunk_length}"
+            self._num_valid_indices += valid_len
+
+            self._episode_cum_ends.append(
+                self._num_valid_indices
             )
 
     def _load_parquet(self, episode_idx: int) -> pd.DataFrame:

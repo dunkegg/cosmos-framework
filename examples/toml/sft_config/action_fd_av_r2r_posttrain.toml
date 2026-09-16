@@ -36,12 +36,12 @@ mode = "selective"
 vae_path = "${oc.env:WAN_VAE_PATH}"
 
 [scheduler]
-cycle_lengths = [20000]
+cycle_lengths = [100000]
 
 [trainer]
-max_iter     = 20000
-logging_iter = 50
+max_iter     = 100000
+logging_iter = 500
 
 [checkpoint]
 load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
-save_iter = 2500
+save_iter = 20000
