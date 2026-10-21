@@ -1,0 +1,7 @@
+{
+  "name": "nav_reward_test",
+  "model_mode": "reasoner",
+  "prompt": "You are evaluating an egocentric robot navigation video. Instruction: Go around the obstacle on the right side. Analyze the robot's movement, whether it follows the instructed direction, and whether it makes progress. Return a JSON object with instruction_match (0 to 1), progress (0 to 1), and reason.",
+  "vision_path": "/mnt/nas/wzj/cosmos-framework/datasets/rxr_sub/trajectory_ranking_xy_chunksize_60/debug_videos/ep000000_s0_f000042_bad.mp4",
+  "video_fps": 2
+}

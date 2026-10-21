@@ -13,4 +13,5 @@ python -m wzj_tools.test_r2r_fd \
   --start-frame 0 \
   --num-gpus 4 \
   --master-port 29511 \
-  --output-dir outputs/r2r_fd_test
+  --output-dir outputs/r2r_fd_test_40000_lr \
+  --flip-lr

@@ -238,6 +238,11 @@ def main():
         "--prepare-only",
         action="store_true",
     )
+    parser.add_argument(
+        "--flip-lr",
+        action="store_true",
+        help="Mirror the navigation action left/right while keeping forward motion unchanged.",
+    )
 
     args = parser.parse_args()
     dataset_root = Path(args.dataset_root).resolve()
@@ -321,6 +326,13 @@ def main():
         local_traj = df.iloc[
             start_frame
         ]["local_traj"]
+
+        if args.flip_lr:
+            local_traj = [
+                [float(p[0]), -float(p[1]), float(p[2])]
+                for p in local_traj
+            ]
+            print("[action] left/right flipped")
 
         action = dataset._local_traj_to_action(
             local_traj
