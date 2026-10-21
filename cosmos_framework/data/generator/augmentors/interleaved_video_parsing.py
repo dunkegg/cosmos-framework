@@ -1,18 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
+import math
 import random
 from collections.abc import Callable
+from functools import partial
 from typing import Optional
 
 import numpy as np
 import omegaconf
 import torch
+import torchvision.transforms.functional as transforms_F
 from einops import rearrange
 from torchcodec.decoders import VideoDecoder
 from torchvision.transforms.v2 import Resize, UniformTemporalSubsample
 
-from cosmos_framework.data.imaginaire.webdataset.augmentors.image.misc import obtain_augmentation_size
+from cosmos_framework.data.imaginaire.webdataset.augmentors.image.misc import obtain_aspect_ratio, obtain_augmentation_size
+from cosmos_framework.data.imaginaire.webdataset.augmentors.image.resize import AspectRatioFilterStats, ResizeToSize
 from cosmos_framework.utils import log
 from cosmos_framework.data.generator.augmentors.video_parsing import VideoParsingWithFullFrames
 
@@ -20,18 +24,25 @@ from cosmos_framework.data.generator.augmentors.video_parsing import VideoParsin
 # private symbols of ``video_parsing.py``. Behavior matches the originals.
 _PostDecodeTransforms = list[Callable[[torch.Tensor], torch.Tensor]] | None
 _SUPPORTS_VIDEO_DECODER_TRANSFORMS: bool | None = None
+_SUPPORTS_VIDEO_DECODER_OUTPUT_DTYPE: bool | None = None
 _WARNED_POST_DECODE_TRANSFORMS = False
+_WARNED_POST_DECODE_OUTPUT_DTYPE = False
 
 
-def _create_video_decoder(
+def _uint8_frames_to_float32(frames: torch.Tensor) -> torch.Tensor:
+    """Match TorchCodec's float32 output contract on releases that only decode uint8."""
+    if frames.dtype != torch.uint8:
+        raise ValueError(f"Expected legacy TorchCodec to decode uint8 frames, got {frames.dtype}.")
+    return frames.to(dtype=torch.float32).div_(255.0)  # [T,C,H,W]
+
+
+def _create_video_decoder_with_transforms(
     video: bytes,
-    seek_mode: str,
-    num_ffmpeg_threads: int,
-    transforms: _PostDecodeTransforms = None,
+    kwargs: dict[str, object],
+    transforms: _PostDecodeTransforms,
 ) -> tuple[VideoDecoder, _PostDecodeTransforms]:
     global _SUPPORTS_VIDEO_DECODER_TRANSFORMS, _WARNED_POST_DECODE_TRANSFORMS
 
-    kwargs = {"seek_mode": seek_mode, "num_ffmpeg_threads": num_ffmpeg_threads}
     if transforms is None:
         return VideoDecoder(video, **kwargs), None
 
@@ -40,8 +51,8 @@ def _create_video_decoder(
             decoder = VideoDecoder(video, transforms=transforms, **kwargs)
             _SUPPORTS_VIDEO_DECODER_TRANSFORMS = True
             return decoder, None
-        except TypeError as e:
-            if "transforms" not in str(e):
+        except TypeError as error:
+            if "transforms" not in str(error):
                 raise
             _SUPPORTS_VIDEO_DECODER_TRANSFORMS = False
 
@@ -55,6 +66,50 @@ def _create_video_decoder(
     return VideoDecoder(video, **kwargs), transforms
 
 
+def _create_video_decoder(
+    video: bytes,
+    seek_mode: str,
+    num_ffmpeg_threads: int,
+    transforms: _PostDecodeTransforms = None,
+    output_dtype: torch.dtype = torch.uint8,
+) -> tuple[VideoDecoder, _PostDecodeTransforms]:
+    global _SUPPORTS_VIDEO_DECODER_OUTPUT_DTYPE, _WARNED_POST_DECODE_OUTPUT_DTYPE
+
+    kwargs: dict[str, object] = {
+        "seek_mode": seek_mode,
+        "num_ffmpeg_threads": num_ffmpeg_threads,
+    }
+    requests_float32 = output_dtype == torch.float32
+    if output_dtype not in (torch.uint8, torch.float32):
+        raise ValueError(f"Unsupported video output dtype {output_dtype}.")
+    if requests_float32 and _SUPPORTS_VIDEO_DECODER_OUTPUT_DTYPE is not False:
+        kwargs["output_dtype"] = output_dtype
+
+    if requests_float32 and _SUPPORTS_VIDEO_DECODER_OUTPUT_DTYPE is False:
+        return VideoDecoder(video, **kwargs), [_uint8_frames_to_float32, *(transforms or [])]
+
+    try:
+        decoder, post_decode_transforms = _create_video_decoder_with_transforms(video, kwargs, transforms)
+    except TypeError as error:
+        if not requests_float32 or "output_dtype" not in str(error):
+            raise
+        _SUPPORTS_VIDEO_DECODER_OUTPUT_DTYPE = False
+        kwargs.pop("output_dtype")
+        if not _WARNED_POST_DECODE_OUTPUT_DTYPE:
+            log.warning(
+                "Installed torchcodec does not support VideoDecoder(output_dtype=torch.float32); "
+                "decoding uint8 and scaling frames to float32 in [0, 1].",
+                rank0_only=True,
+            )
+            _WARNED_POST_DECODE_OUTPUT_DTYPE = True
+        # Convert before resize so the fallback follows the native float32 transform order.
+        return VideoDecoder(video, **kwargs), [_uint8_frames_to_float32, *(transforms or [])]
+
+    if requests_float32:
+        _SUPPORTS_VIDEO_DECODER_OUTPUT_DTYPE = True
+    return decoder, post_decode_transforms
+
+
 def _apply_post_decode_transforms(
     frames: torch.Tensor, transforms: _PostDecodeTransforms
 ) -> torch.Tensor:  # frames: [T,C,H,W], returns: [T,C,H,W]
@@ -64,6 +119,14 @@ def _apply_post_decode_transforms(
     for transform in transforms:
         frames = transform(frames)  # [T,C,H,W]
     return frames
+
+
+class ControlResizeConfigurationError(ValueError):
+    """A configured transfer control has no supported direct-resize policy."""
+
+
+class AspectRatioRejected(ValueError):
+    """A decoded clip exceeds the configured stretch limit and should be skipped."""
 
 
 class VideoTransferAlignedFullFramesParsing(VideoParsingWithFullFrames):
@@ -81,8 +144,65 @@ class VideoTransferAlignedFullFramesParsing(VideoParsingWithFullFrames):
         self.input_keys = input_keys
         self.control_video_keys = input_keys[2:]
         self.min_stride_key = self.args.get("min_stride_key", "_full_frames_min_stride")
+        self.aspect_ratio_stats: AspectRatioFilterStats = AspectRatioFilterStats()
+        if self.args.get("direct_resize") is not None:
+            for control_video_key in self.control_video_keys:
+                if control_video_key != "persisted_control":
+                    self._control_resize_modality({}, control_video_key)
 
-    def _build_rgb_decode_transform(self, data_dict: dict, meta_dict: dict) -> list[Resize] | None:
+    @staticmethod
+    def _control_resize_modality(data_dict: dict, control_video_key: str) -> str:
+        if control_video_key == "persisted_control":
+            modality = data_dict.get("_selected_control_modality")
+            if not isinstance(modality, str) or modality not in {"depth", "seg"}:
+                raise ControlResizeConfigurationError(
+                    "Direct resize for 'persisted_control' requires _selected_control_modality "
+                    f"to be 'depth' or 'seg', got {modality!r}."
+                )
+            return modality
+        # Match DataDictMerger's transfer-key recognition and depth precedence.
+        if isinstance(control_video_key, str):
+            if "depth" in control_video_key:
+                return "depth"
+            if "segmentation" in control_video_key:
+                return "seg"
+        raise ControlResizeConfigurationError(
+            f"Direct resize has no policy for control key {control_video_key!r}. "
+            "Expected a key containing 'depth' or 'segmentation', or 'persisted_control' "
+            "with an explicit selected modality."
+        )
+
+    def _validate_control_resize_configuration(self, data_dict: dict) -> None:
+        if self.args.get("direct_resize") is not None:
+            for control_video_key in self.control_video_keys:
+                self._control_resize_modality(data_dict, control_video_key)
+
+    def _build_rgb_decode_transform(self, data_dict: dict, meta_dict: dict) -> _PostDecodeTransforms:
+        direct_resize = self.args.get("direct_resize")
+        if direct_resize is not None:
+            aspect_ratio = obtain_aspect_ratio(data_dict)
+            target_size = obtain_augmentation_size(data_dict, direct_resize)
+            resize_args = {**direct_resize, "size": {aspect_ratio: target_size}, "log_aspect_ratio_stats": False}
+            if "_res_max_aspect_ratio_distortion" in data_dict:
+                resize_args["max_aspect_ratio_distortion"] = data_dict["_res_max_aspect_ratio_distortion"]
+            resize = ResizeToSize(input_keys=["video"], args=resize_args)
+            first_batch = True
+
+            def resize_rgb(frames: torch.Tensor) -> torch.Tensor:  # frames/returns: [T,C,H,W]
+                nonlocal first_batch
+                # Validate actual decoded dimensions before the first batch is resized.
+                output = resize({"video": frames, "aspect_ratio": aspect_ratio})
+                if first_batch and resize_args.get("max_aspect_ratio_distortion") is not None:
+                    # The decode loop can resize many batches; count each clip once.
+                    self.aspect_ratio_stats.record(
+                        aspect_ratio, (int(target_size[0]), int(target_size[1])), output is not None
+                    )
+                first_batch = False
+                if output is None:
+                    raise AspectRatioRejected("Decoded RGB aspect ratio exceeds the allowed resize distortion.")
+                return output["video"]  # [T,C,H_target,W_target]
+
+            return [resize_rgb]
         if not self.perform_resize:
             return None
 
@@ -99,6 +219,24 @@ class VideoTransferAlignedFullFramesParsing(VideoParsingWithFullFrames):
             f"Resize error. orig {(orig_w, orig_h)} desire {img_size} compute {target_size}"
         )
         return [Resize(target_size)]
+
+    def _build_control_decode_transform(self, data_dict: dict, control_video_key: str) -> _PostDecodeTransforms:
+        direct_resize = self.args.get("direct_resize")
+        if direct_resize is None:
+            return None
+        modality = self._control_resize_modality(data_dict, control_video_key)
+        target_size = obtain_augmentation_size(data_dict, direct_resize)
+        assert isinstance(target_size, (tuple, list, omegaconf.listconfig.ListConfig))
+        width, height = map(int, target_size)
+        interpolation = {
+            "depth": transforms_F.InterpolationMode.BILINEAR,
+            "seg": transforms_F.InterpolationMode.NEAREST,
+        }[modality]
+        return [
+            partial(
+                transforms_F.resize, size=(height, width), interpolation=interpolation, antialias=modality == "depth"
+            )
+        ]
 
     def _sample_frame_indices(self, decoder_len: int, min_stride_override: int | None = None) -> tuple[list[int], int]:
         min_stride = int(min_stride_override) if min_stride_override is not None else self.min_stride
@@ -128,24 +266,62 @@ class VideoTransferAlignedFullFramesParsing(VideoParsingWithFullFrames):
         self,
         video: bytes,
         frame_indices: list[int],
-        transforms: list[Resize] | None = None,
+        transforms: _PostDecodeTransforms = None,
+        output_dtype: torch.dtype = torch.uint8,
     ) -> torch.Tensor:  # returns [C,T,H,W]
+        direct_resize = self.args.get("direct_resize") is not None
         video_decoder, post_decode_transforms = _create_video_decoder(
             video,
             self.seek_mode,
             self.video_decode_num_threads,
-            transforms,
+            None if direct_resize else transforms,
+            output_dtype,
         )
+        if direct_resize:
+            # TorchCodec only supports bilinear decoder resizing. Keep the requested
+            # kernel after any legacy dtype conversion, operating on bounded batches.
+            post_decode_transforms = [*(post_decode_transforms or []), *(transforms or [])] or None
         try:
-            frame_batch = video_decoder.get_frames_at(frame_indices)
-            frames = frame_batch.data  # [T,C,H,W]
-            frames = _apply_post_decode_transforms(frames, post_decode_transforms)  # [T,C,H,W]
+            if post_decode_transforms is None:
+                frame_batch = video_decoder.get_frames_at(frame_indices)
+                frames = frame_batch.data  # [T,C,H,W]
+            else:
+                if not frame_indices:
+                    raise ValueError("Cannot transform an empty video frame plan.")
+                resized_frames: torch.Tensor | None = None  # [T,C,Htarget,Wtarget]
+                chunk_start = 0
+                chunk_size = 1
+                while chunk_start < len(frame_indices):
+                    chunk_indices = frame_indices[chunk_start : chunk_start + chunk_size]
+                    frame_batch = video_decoder.get_frames_at(chunk_indices)
+                    source_frames = frame_batch.data  # [Tc,C,H,W]
+                    if resized_frames is None:
+                        # Probe one decoded frame before choosing a batch size. The
+                        # float32 estimate also covers legacy uint8 conversion/resize.
+                        frame_working_bytes = source_frames.numel() * max(4, source_frames.element_size())
+                        chunk_size = max(1, min(8, 32 * 1024**2 // frame_working_bytes))
+                    transformed_frames = _apply_post_decode_transforms(
+                        source_frames, post_decode_transforms
+                    )  # [Tc,C,Htarget,Wtarget]
+                    if resized_frames is None:
+                        resized_frames = transformed_frames.new_empty(
+                            (len(frame_indices), *transformed_frames.shape[1:])
+                        )  # [T,C,Htarget,Wtarget]
+                    chunk_end = chunk_start + len(chunk_indices)
+                    resized_frames[chunk_start:chunk_end].copy_(transformed_frames)  # [Tc,C,Htarget,Wtarget]
+                    # Release native frames before decoding the next batch, including
+                    # the FrameBatch reference that owns the original tensor.
+                    del frame_batch, source_frames, transformed_frames
+                    chunk_start = chunk_end
+                assert resized_frames is not None
+                frames = resized_frames  # [T,C,Htarget,Wtarget]
             frames = frames.permute(1, 0, 2, 3)  # [C,T,H,W]
         finally:
             del video_decoder
         return frames  # [C,T,H,W]
 
     def __call__(self, data_dict: dict) -> dict | None:
+        self._validate_control_resize_configuration(data_dict)
         try:
             meta_dict = data_dict[self.meta_key]
             video = data_dict[self.video_key]
@@ -194,6 +370,8 @@ class VideoTransferAlignedFullFramesParsing(VideoParsingWithFullFrames):
                 return None
 
             video_frames = self._decode_frames_at(video, frame_indices, rgb_transform)  # [C,T,H,W]
+        except AspectRatioRejected:
+            return None
         except Exception as e:
             log.warning(
                 f"Failed to decode RGB video. url: {data_dict['__url__']}, key: {data_dict['__key__']}, error: {e}",
@@ -218,7 +396,10 @@ class VideoTransferAlignedFullFramesParsing(VideoParsingWithFullFrames):
 
         for control_video_key, control_video in control_videos.items():
             try:
-                control_frames = self._decode_frames_at(control_video, frame_indices)  # [C,T,H,W]
+                control_transform = self._build_control_decode_transform(data_dict, control_video_key)
+                control_frames = self._decode_frames_at(control_video, frame_indices, control_transform)  # [C,T,H,W]
+            except ControlResizeConfigurationError:
+                raise
             except Exception as e:
                 log.warning(
                     f"Failed to decode {control_video_key}. "
@@ -277,11 +458,14 @@ class VideoTransferAlignedLegacyChunkParsing(VideoTransferAlignedFullFramesParsi
         video: bytes,
         control_videos: dict[str, bytes],
         frame_indices: list[int],
-        rgb_transform: list[Resize] | None,
+        rgb_transform: _PostDecodeTransforms,
+        data_dict: dict,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         video_frames = self._decode_frames_at(video, frame_indices, rgb_transform)  # [C,T,H,W]
         control_frames_by_key = {
-            control_video_key: self._decode_frames_at(control_video, frame_indices)  # [C,T,H,W]
+            control_video_key: self._decode_frames_at(
+                control_video, frame_indices, self._build_control_decode_transform(data_dict, control_video_key)
+            )  # [C,T,H,W]
             for control_video_key, control_video in control_videos.items()
         }
         return video_frames, control_frames_by_key
@@ -299,6 +483,7 @@ class VideoTransferAlignedLegacyChunkParsing(VideoTransferAlignedFullFramesParsi
         return video_frames, control_frames_by_key
 
     def __call__(self, data_dict: dict) -> dict | None:
+        self._validate_control_resize_configuration(data_dict)
         try:
             meta_dict = data_dict[self.meta_key]
             video = data_dict[self.video_key]
@@ -390,8 +575,12 @@ class VideoTransferAlignedLegacyChunkParsing(VideoTransferAlignedFullFramesParsi
 
             try:
                 video_frames, control_frames_by_key = self._decode_all_streams_at(
-                    video, control_videos, frame_indices, rgb_transform
+                    video, control_videos, frame_indices, rgb_transform, data_dict
                 )  # [C,T,H,W]
+            except AspectRatioRejected:
+                return None
+            except ControlResizeConfigurationError:
+                raise
             except Exception as e:
                 log.warning(
                     f"Failed to decode aligned video streams. "
@@ -444,13 +633,48 @@ class VideoTransferAlignedLegacyChunkParsing(VideoTransferAlignedFullFramesParsi
 class VideoTransferAlignedChunkedFramesParsing(VideoTransferAlignedFullFramesParsing):
     """Decode RGB and aligned control videos for a selected caption chunk."""
 
+    def __init__(self, input_keys: list, output_keys: list | None = None, args: dict | None = None) -> None:
+        super().__init__(input_keys=input_keys, output_keys=output_keys, args=args)
+        self.min_num_frames = int(self.args.get("min_num_frames", 1))
+        assert self.min_num_frames >= 1, f"min_num_frames must be >= 1, got {self.min_num_frames}"
+        self.teacher_forcing_frames_per_chunk = int(self.args.get("teacher_forcing_frames_per_chunk", 1))
+        assert self.teacher_forcing_frames_per_chunk >= 1, (
+            f"teacher_forcing_frames_per_chunk must be >= 1, got {self.teacher_forcing_frames_per_chunk}"
+        )
+        self.target_num_frames: int | None = self.args.get("target_num_frames")
+        if self.target_num_frames is not None:
+            if not self.min_num_frames <= self.target_num_frames <= self.args.get("max_num_frames", 1000):
+                raise ValueError("target_num_frames must lie between min_num_frames and max_num_frames.")
+            if self.target_num_frames < 1 or (self.target_num_frames - 1) % (4 * self.teacher_forcing_frames_per_chunk):
+                raise ValueError("target_num_frames must contain complete VAE/teacher-forcing chunks after frame one.")
+
     def _sample_frame_indices_for_chunk(
         self,
         decoder_len: int,
         chunk_start: int,
         chunk_end: int,
         min_stride_override: int | None = None,
-    ) -> tuple[list[int], int]:
+    ) -> tuple[list[int], float]:
+        if self.target_num_frames is not None:
+            # A caption describes its complete window. Resample that whole span,
+            # rather than retaining its narrative after an unrelated prefix crop.
+            if chunk_start < 0 or chunk_end > decoder_len or chunk_end - chunk_start < self.target_num_frames:
+                return [], 0
+            if self.target_num_frames == 1:
+                # Only a one-frame caption window is faithful to a one-frame
+                # output; never collapse a multi-frame narrative into a still.
+                if chunk_end - chunk_start != 1:
+                    return [], 0
+                effective_stride = 1.0
+            else:
+                effective_stride = (chunk_end - chunk_start - 1) / (self.target_num_frames - 1)
+            min_stride = int(min_stride_override) if min_stride_override is not None else self.min_stride
+            max_stride = max(self.max_stride, min_stride)
+            if not min_stride <= effective_stride <= max_stride:
+                return [], effective_stride
+            frame_indices = [chunk_start + round(frame * effective_stride) for frame in range(self.target_num_frames)]
+            return frame_indices, effective_stride
+
         chunk_start = max(0, min(chunk_start, decoder_len))
         chunk_end = max(chunk_start, min(chunk_end, decoder_len))
         if chunk_end <= chunk_start:
@@ -464,11 +688,16 @@ class VideoTransferAlignedChunkedFramesParsing(VideoTransferAlignedFullFramesPar
         if max_num_frames < 1:
             return [], stride
 
-        # Wan VAE temporal compression expects 1 + 4N video frames.
-        num_video_frames = 1 + 4 * ((max_num_frames - 1) // 4)
+        # Wan VAE compresses every four pixel frames after the first frame into one
+        # latent. Align the result to complete teacher-forcing chunks as well.
+        pixel_frames_per_chunk = 4 * self.teacher_forcing_frames_per_chunk
+        num_video_frames = 1 + pixel_frames_per_chunk * ((max_num_frames - 1) // pixel_frames_per_chunk)
+        if num_video_frames < self.min_num_frames:
+            return [], stride
         return frame_indices[:num_video_frames], stride
 
     def __call__(self, data_dict: dict) -> dict | None:
+        self._validate_control_resize_configuration(data_dict)
         try:
             meta_dict = data_dict[self.meta_key]
             video = data_dict[self.video_key]
@@ -521,14 +750,23 @@ class VideoTransferAlignedChunkedFramesParsing(VideoTransferAlignedFullFramesPar
             )
             if len(frame_indices) == 0:
                 log.warning(
-                    f"VideoTransferAlignedChunkedFramesParsing: empty chunk after clamping/stride. "
+                    f"VideoTransferAlignedChunkedFramesParsing: chunk has fewer than "
+                    f"{self.min_num_frames} VAE-aligned frames after clamping/stride. "
                     f"chunk=[{chunk_start},{chunk_end}), aligned_decoder_len={aligned_decoder_len}, "
                     f"url: {data_dict['__url__']}, key: {data_dict['__key__']}",
                     rank0_only=False,
                 )
                 return None
+            if self.target_num_frames is not None and not (
+                self.args.get("min_fps", 0.0)
+                <= meta_dict["framerate"] / stride
+                <= self.args.get("max_fps", float("inf"))
+            ):
+                return None
 
             video_frames = self._decode_frames_at(video, frame_indices, rgb_transform)  # [C,T,H,W]
+        except AspectRatioRejected:
+            return None
         except Exception as e:
             log.warning(
                 f"Failed to decode RGB video. url: {data_dict['__url__']}, key: {data_dict['__key__']}, error: {e}",
@@ -553,7 +791,10 @@ class VideoTransferAlignedChunkedFramesParsing(VideoTransferAlignedFullFramesPar
 
         for control_video_key, control_video in control_videos.items():
             try:
-                control_frames = self._decode_frames_at(control_video, frame_indices)  # [C,T,H,W]
+                control_transform = self._build_control_decode_transform(data_dict, control_video_key)
+                control_frames = self._decode_frames_at(control_video, frame_indices, control_transform)  # [C,T,H,W]
+            except ControlResizeConfigurationError:
+                raise
             except Exception as e:
                 log.warning(
                     f"Failed to decode {control_video_key}. "
@@ -569,3 +810,213 @@ class VideoTransferAlignedChunkedFramesParsing(VideoTransferAlignedFullFramesPar
         data_dict.pop("chunk_start_frame", None)
         data_dict.pop("chunk_end_frame", None)
         return data_dict
+
+
+class VideoTransferAlignedSelectedControlParsing(VideoTransferAlignedChunkedFramesParsing):
+    """Decode a selected caption window and only its preselected persisted control, when required."""
+
+    _PERSISTED_MODALITIES = {"depth", "seg"}
+
+    def __init__(self, input_keys: list, output_keys: Optional[list] = None, args: Optional[dict] = None) -> None:
+        assert input_keys == ["metas", "video"], (
+            "VideoTransferAlignedSelectedControlParsing requires exactly [metas, video]; "
+            "persisted_control is selected dynamically."
+        )
+        super().__init__(input_keys=input_keys, output_keys=output_keys, args=args)
+        self.fps_tolerance = float(self.args.get("aligned_fps_tolerance", 1e-3))
+        self._expected_decode_metadata: list[tuple[bytes, dict]] = []
+
+    @staticmethod
+    def _required_number(meta: dict, key: str) -> float | None:
+        value = meta.get(key)
+        if value is None:
+            return None
+        return float(value)
+
+    def _fps_matches_with_one_frame_tolerance(
+        self,
+        first_fps: float,
+        second_fps: float,
+        frame_count: int | None,
+    ) -> bool:
+        if math.isclose(first_fps, second_fps, rel_tol=0.0, abs_tol=self.fps_tolerance):
+            return True
+        if first_fps <= 0.0 or second_fps <= 0.0 or frame_count is None or frame_count < 1:
+            return False
+        duration_delta = abs(frame_count / first_fps - frame_count / second_fps)
+        one_frame_seconds = max(1.0 / first_fps, 1.0 / second_fps)
+        return duration_delta <= one_frame_seconds + 1e-9
+
+    def _validate_persisted_metadata(self, data_dict: dict, persisted_meta: dict) -> bool:
+        rgb_meta = data_dict[self.meta_key]
+        for key in ("width", "height", "framerate"):
+            if self._required_number(rgb_meta, key) is None or self._required_number(persisted_meta, key) is None:
+                log.warning(
+                    f"Selected persisted control requires RGB/control descriptor field {key!r}. "
+                    f"url: {data_dict.get('__url__')}, key: {data_dict.get('__key__')}",
+                    rank0_only=False,
+                )
+                return False
+        for key in ("width", "height"):
+            rgb_value = self._required_number(rgb_meta, key)
+            persisted_value = self._required_number(persisted_meta, key)
+            if rgb_value != persisted_value:
+                log.warning(
+                    f"Selected persisted control {key}={persisted_value} does not match RGB {key}={rgb_value}. "
+                    f"url: {data_dict.get('__url__')}, key: {data_dict.get('__key__')}",
+                    rank0_only=False,
+                )
+                return False
+        rgb_fps = self._required_number(rgb_meta, "framerate")
+        persisted_fps = self._required_number(persisted_meta, "framerate")
+        assert rgb_fps is not None and persisted_fps is not None
+        frame_counts = [self._required_number(meta, "nb_frames") for meta in (rgb_meta, persisted_meta)]
+        comparable_frame_count = (
+            int(min(value for value in frame_counts if value is not None))
+            if any(value is not None for value in frame_counts)
+            else None
+        )
+        if not self._fps_matches_with_one_frame_tolerance(rgb_fps, persisted_fps, comparable_frame_count):
+            log.warning(
+                f"Selected persisted control fps={persisted_fps} does not match RGB fps={rgb_fps}. "
+                f"url: {data_dict.get('__url__')}, key: {data_dict.get('__key__')}",
+                rank0_only=False,
+            )
+            return False
+        return True
+
+    def _probe_video_len(self, video: bytes) -> int:
+        """Validate descriptor geometry/FPS against the TorchCodec stream header."""
+        decoder = VideoDecoder(
+            video,
+            seek_mode=self.seek_mode,
+            num_ffmpeg_threads=self.video_decode_num_threads,
+        )
+        try:
+            decoder_len = len(decoder)
+            expected = next((meta for payload, meta in self._expected_decode_metadata if payload is video), None)
+            if expected is not None:
+                actual = {
+                    "width": decoder.metadata.width,
+                    "height": decoder.metadata.height,
+                    "framerate": decoder.metadata.average_fps,
+                    "nb_frames": decoder_len,
+                }
+                for key in ("width", "height", "nb_frames"):
+                    expected_value = self._required_number(expected, key)
+                    if expected_value is not None and expected_value != float(actual[key]):
+                        raise ValueError(
+                            f"Decoded {key}={actual[key]} does not match descriptor {key}={expected_value}."
+                        )
+                expected_fps = self._required_number(expected, "framerate")
+                actual_fps = float(actual["framerate"])
+                if expected_fps is not None and not self._fps_matches_with_one_frame_tolerance(
+                    expected_fps,
+                    actual_fps,
+                    decoder_len,
+                ):
+                    raise ValueError(
+                        f"Decoded framerate={actual_fps} does not match descriptor framerate={expected_fps}."
+                    )
+            return decoder_len
+        finally:
+            del decoder
+
+    @staticmethod
+    def _normalize_depth_frames(frames: torch.Tensor) -> torch.Tensor:  # frames: [C,T,H,W], returns [3,T,H,W]
+        if frames.shape[0] not in (1, 3):
+            raise ValueError(f"Depth video must decode to one or three channels, got {tuple(frames.shape)}.")
+        if frames.dtype != torch.float32:
+            raise ValueError(f"Depth video must decode to float32, got {frames.dtype}.")
+        if not torch.isfinite(frames).all():
+            raise ValueError("Depth video contains non-finite values.")
+        min_value = frames.min().item()
+        max_value = frames.max().item()
+        # Float32 resizing can introduce small overshoots at the endpoints.
+        if min_value < -1e-6 or max_value > 1.0 + 1e-6:
+            raise ValueError(f"Depth video values must be in [0, 1], got [{min_value}, {max_value}].")
+        if min_value < 0.0 or max_value > 1.0:
+            log.warning(
+                f"Clamping depth roundoff [{min_value}, {max_value}] to [0, 1] (tolerance=1e-6); keeping the sample.",
+                rank0_only=False,
+            )
+            frames = frames.clamp(0.0, 1.0)  # [C,T,H,W]
+        if frames.shape[0] == 1:
+            frames = frames.expand(3, -1, -1, -1)  # [3,T,H,W]
+        return frames.mul(255.0)  # [3,T,H,W]
+
+    def _decode_frames_at(
+        self,
+        video: bytes,
+        frame_indices: list[int],
+        transforms: _PostDecodeTransforms = None,
+        output_dtype: torch.dtype = torch.uint8,
+    ) -> torch.Tensor:  # returns [C,T,H,W]
+        if video is getattr(self, "_depth_control_video", None):
+            output_dtype = torch.float32
+        return super()._decode_frames_at(video, frame_indices, transforms, output_dtype)  # [C,T,H,W]
+
+    def __call__(self, data_dict: dict) -> dict | None:
+        modality = data_dict.get("_selected_control_modality")
+        control_bytes: bytes | None = None
+        if not isinstance(modality, str) or modality not in {"edge", "blur", "depth", "seg"}:
+            if self.args.get("direct_resize") is not None:
+                raise ControlResizeConfigurationError(
+                    "Selected-control direct resize requires _selected_control_modality to be "
+                    f"'edge', 'blur', 'depth', or 'seg', got {modality!r}."
+                )
+            log.warning(f"Unknown selected transfer modality {modality!r}.", rank0_only=False)
+            return None
+        persisted = modality in self._PERSISTED_MODALITIES
+        if persisted:
+            control_bytes = data_dict.get("persisted_control")
+            persisted_meta = data_dict.get("_persisted_control_meta")
+            if not isinstance(control_bytes, bytes) or not isinstance(persisted_meta, dict):
+                log.warning(f"Missing selected persisted control for modality {modality!r}.", rank0_only=False)
+                return None
+            if not self._validate_persisted_metadata(data_dict, persisted_meta):
+                return None
+
+        self.control_video_keys = ["persisted_control"] if persisted else []
+        self._depth_control_video = control_bytes if modality == "depth" else None
+        self._expected_decode_metadata = [(data_dict["video"], data_dict[self.meta_key])]
+        if persisted:
+            self._expected_decode_metadata.append(
+                (data_dict["persisted_control"], data_dict["_persisted_control_meta"])
+            )
+        try:
+            parsed = super().__call__(data_dict)
+        finally:
+            self.control_video_keys = []
+            self._depth_control_video = None
+            self._expected_decode_metadata = []
+        if parsed is None:
+            return None
+        if not persisted:
+            return parsed
+
+        persisted_video = parsed.get("persisted_control")
+        if not isinstance(persisted_video, dict) or not isinstance(persisted_video.get("video"), torch.Tensor):
+            return None
+        control_frames = persisted_video["video"]  # [C,T,H,W]
+        rgb_frames = parsed["video"]["video"]  # [C,T,H,W]
+        if control_frames.shape[1] != rgb_frames.shape[1]:
+            log.warning("RGB and persisted control decoded unequal frame counts.", rank0_only=False)
+            return None
+        if modality == "depth":
+            try:
+                control_frames = self._normalize_depth_frames(control_frames)  # [3,T,H,W]
+            except ValueError as error:
+                log.warning(str(error), rank0_only=False)
+                return None
+            parsed["depth"] = control_frames  # [3,T,H,W]
+        else:
+            if control_frames.shape[0] != 3:
+                log.warning(
+                    f"Semantic video must decode to three channels, got {tuple(control_frames.shape)}.",
+                    rank0_only=False,
+                )
+                return None
+            parsed["segmentation"] = control_frames  # [3,T,H,W]
+        parsed.pop("persisted_control", None)
+        return parsed

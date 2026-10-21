@@ -5,9 +5,10 @@ import argparse
 import os
 import sys
 import time
+from collections.abc import Mapping
 
 import torch
-from omegaconf import OmegaConf
+import yaml
 
 from cosmos_framework.utils.config import Config
 from cosmos_framework.utils import distributed, log
@@ -18,6 +19,12 @@ from cosmos_framework.utils.wandb_util import set_wandb_job_info
 
 # Global variable to track S3 readiness
 S3_READY = False
+
+
+def _save_reproducibility_yaml(data: Mapping[str, object], path: str) -> None:
+    """Save metadata as literal YAML without interpreting OmegaConf interpolation syntax."""
+    with open(path, "w") as file:
+        yaml.safe_dump(data, file, sort_keys=False, default_flow_style=False, allow_unicode=True)
 
 
 def log_reproducible_setup(config: Config, args: argparse.Namespace) -> None:
@@ -41,7 +48,8 @@ def log_reproducible_setup(config: Config, args: argparse.Namespace) -> None:
         - Saves the job configuration locally only for the main node in a distributed setting.
         - Captures and logs command-line execution details.
         - Optionally reads git commit and branch information if available and logs them.
-        - Saves both job environment information and launch details locally and syncs these to S3.
+        - Uploads config.yaml for jobs with checkpoint object storage enabled, independently of the setup flag.
+        - Saves both job environment information and launch details locally and optionally syncs these to S3.
         - Supports conditional integration with Weights & Biases (wandb) for experiment tracking.
 
     Notes:
@@ -49,7 +57,7 @@ def log_reproducible_setup(config: Config, args: argparse.Namespace) -> None:
           (like saving configurations) are restricted to the main node (rank 0).
         - It uses the 'easy_io' module for interacting with S3, ensuring files are written and
           read correctly from the object store.
-        - It leverages OmegaConf for saving YAML configurations
+        - It saves metadata as literal YAML so shell syntax in captured git diffs remains unchanged.
         - git information is read from 'git_commit.txt' and 'git_branch.txt' files if they exist.
         - snapshot codebase is saved as 'codebase.zip' if it exists in the current directory.
 
@@ -66,6 +74,7 @@ def log_reproducible_setup(config: Config, args: argparse.Namespace) -> None:
     run_timestamp = time_tensor.cpu().numpy().tobytes().decode("utf-8")
 
     global S3_READY
+    S3_READY = False
     if os.path.exists(config.checkpoint.save_to_object_store.credentials) or CRED_ENVS.APP_ENV in [
         "prod",
         "dev",
@@ -114,13 +123,24 @@ def log_reproducible_setup(config: Config, args: argparse.Namespace) -> None:
                 job_info["git_diff"] = f.read().strip()
                 log.critical(f"git diff: {job_info['git_diff']}")
 
-        with open(f"{job_local_path}/job_env.yaml", "w") as f:
-            OmegaConf.save(job_info, f)
-        with open(f"{job_local_path}/launch_info.yaml", "w") as f:
-            OmegaConf.save(launch_info, f)
+        _save_reproducibility_yaml(job_info, f"{job_local_path}/job_env.yaml")
+        _save_reproducibility_yaml(launch_info, f"{job_local_path}/launch_info.yaml")
         set_wandb_job_info(job_info)
 
-        # by default, we upload run in ngc and slurm
+        # Keep the readable config by default for remotely saved jobs; explicit setup uploads also include it.
+        save_store = config.checkpoint.save_to_object_store
+        if config.upload_reproducible_setup or (save_store.enabled and save_store.bucket):
+            if S3_READY:
+                try:
+                    easy_io.copyfile_from_local(f"{job_local_path}/config.yaml", "s3://timestamps_rundir/config.yaml")
+                except Exception:
+                    if config.upload_reproducible_setup:
+                        raise
+                    log.exception("Could not upload config.yaml. Continuing with the locally saved config.")
+            else:
+                log.warning("S3 credentials not found. Skipping upload of config.yaml.")
+
+        # Upload the remaining reproducible setup artifacts only when explicitly enabled.
         if config.upload_reproducible_setup:
             # sync to s3
             if S3_READY:
@@ -131,10 +151,6 @@ def log_reproducible_setup(config: Config, args: argparse.Namespace) -> None:
                 config_pkl_save_fp = f"{config.job.path_local}/config.pkl"
                 easy_io.copyfile_from_local(
                     config_pkl_save_fp, f"s3://timestamps_rundir/{config_pkl_save_fp.split('/')[-1]}"
-                )
-                config_yaml_save_fp = config_pkl_save_fp.replace(".pkl", ".yaml")
-                easy_io.copyfile_from_local(
-                    config_yaml_save_fp, f"s3://timestamps_rundir/{config_yaml_save_fp.split('/')[-1]}"
                 )
                 easy_io.copyfile_from_local(f"{job_local_path}/job_env.yaml", "s3://timestamps_rundir/job_env.yaml")
                 easy_io.copyfile_from_local(

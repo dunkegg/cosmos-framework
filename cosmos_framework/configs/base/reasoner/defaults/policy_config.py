@@ -29,10 +29,30 @@ class PolicyConfig:
     #   exponent=0 -> per-token loss: every token contributes equally to the global loss
     #   0 < exponent < 1 -> interpolation; e.g. exponent=0.5 gives square-root per-token loss (Qwen3-VL)
     weighted_ce_exponent: float = 1.0
+    # Opt-in objective change: normalize CE once over the full gradient-accumulation window
+    # instead of averaging independently normalized microbatch ratios.
+    normalize_weighted_ce_over_accumulation_window: bool = False
 
-    # Extra model config
+    # Parameter-efficient fine-tuning.  These fields intentionally live on
+    # the VLM policy instead of reusing the VFM/MoT model config: the two
+    # backends have different module names and checkpoint layouts.
+    lora_enabled: bool = False
+    lora_rank: int = 16
+    lora_alpha: float = 32.0
+    lora_dropout: float = 0.0
+    lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj"
+    lora_bias: str = "none"
+    lora_use_rslora: bool = False
+    lora_modules_to_save: str = ""
+    lora_precision: str | None = None
+
+    # Legacy free-form field retained for config compatibility. New recipes
+    # must use the explicit fields above so PEFT equivalence can be validated.
     lora: Union[str, None] = None
     enable_liger_kernel: bool = False
+    # Dense Qwen3.5 caption opt-ins; other recipes retain the standard logits loss.
+    enable_fused_weighted_ce: bool = False
+    qwen35_fp32_recurrent_a_log: bool = False
     trainable_map: Union[str, None] = None
     monkey_patch_for_text_only_data: bool = False
 
@@ -40,6 +60,45 @@ class PolicyConfig:
     # (NATTEN/blackwell-fmha on GB200). Override to "flash_attention_2",
     # "sdpa", or "eager" for fallback.
     attn_implementation: str = "cosmos"
+
+    # Qwen3-VL's patch projection is a non-overlapping Conv3d and is therefore
+    # algebraically equivalent to a linear projection. ``auto`` selects the
+    # linear implementation on A100 (SM80), where large FSDP runs have exposed
+    # a cuDNN Conv3d backward failure.  No environment-time monkey patch is
+    # required.
+    qwen3_vl_patch_embed: str = "auto"
+
+    def __attrs_post_init__(self) -> None:
+        if self.lora_rank <= 0:
+            raise ValueError("lora_rank must be positive")
+        if self.lora_alpha <= 0:
+            raise ValueError("lora_alpha must be positive")
+        if not 0.0 <= self.lora_dropout < 1.0:
+            raise ValueError("lora_dropout must be in [0, 1)")
+        if self.lora_bias not in {"none", "all", "lora_only"}:
+            raise ValueError("lora_bias must be one of: none, all, lora_only")
+        if self.lora_precision not in {None, "float32", "float16", "bfloat16"}:
+            raise ValueError("lora_precision must be float32, float16, bfloat16, or unset")
+        if self.qwen3_vl_patch_embed not in {"auto", "linear", "conv3d"}:
+            raise ValueError("qwen3_vl_patch_embed must be auto, linear, or conv3d")
+
+
+@attrs.define(slots=False)
+class LBLConfig:
+    """MoE load-balancing auxiliary loss for the Qwen3-VL-MoE backbone.
+
+    The routing statistics are collected every step regardless (the patched MoE block
+    stashes them either way, see ``monkey_patch.patch_qwen3_vl_moe_grouped_mm_experts``);
+    these knobs only control whether a loss term is built from them.
+    """
+
+    # "local" balances each rank's own token counts; "global" sums the counts across the
+    # DP mesh first, balancing the global batch at the cost of a collective per step.
+    method: str = attrs.field(default="local", validator=attrs.validators.in_({"local", "global"}))
+
+    # Multiplier on the load-balancing loss added to the CE objective. None disables the
+    # term entirely, which is the default so existing recipes are unchanged.
+    coeff: float | None = None
 
 
 @attrs.define(slots=False)
@@ -55,7 +114,11 @@ class VLMModelConfig:
     precision: str = "bfloat16"
 
     policy: PolicyConfig = PolicyConfig()
-    # Optional Parakeet inputs for standalone Reasoner CE/SFT, disabled by default.
+
+    # MoE load-balancing auxiliary loss (Qwen3-VL-MoE only), disabled by default.
+    lbl: LBLConfig = LBLConfig()
+
+    # Optional audio inputs for standalone Reasoner CE/SFT, disabled by default.
     sound_und: bool = False
     sound_und_config: SoundUnderstandingConfig = SoundUnderstandingConfig()
     # Applied at model construction, before the optimizer is built.

@@ -17,21 +17,47 @@ class DataSetting:
         qwen_max_video_token_length: Maximum video token length.
         qwen_target_fps: Target fps for video sampling.
         text_chat_order: Order of text items in user messages.
+        strip_thinking_prob: Per-sample probability of converting thinking data into non-thinking data.
+        custom_system_prompt: System prompt injected when a conversation has no leading system message.
+        strip_original_system_prompt: Remove existing system messages before optional custom prompt injection.
         distributor_type: "with_replace" (WeightedShardlistBasic) or "no_replace" (NoReplaceShardlistBasic).
         distributor_seed: Seed for the distributor.
         max_batch_size: Hard cap on the number of samples in each dynamic batch.
         max_tokens: Per-sample token limit used by filtering.
         max_tokens_in_batch: Padded-token budget for dynamic batching.
         long_threshold: Single seed-sample length threshold that emits the sample alone.
+        data_stats_writer_enabled: Write per-sample parquet rows at every checkpoint save; a checkpoint
+            counts as complete only once its rows are flushed and merged.
+        lance_cache_manifest: Recipe cache manifest for the shared remote Lance loader; None uses pinned PAI-v9.
+        lance_data_root: Absolute local root of a receipt-backed conversation Lance export.
     """
 
     qwen_max_video_token_length: int = 8192
     qwen_max_image_token_length: int = 8192
     qwen_target_fps: float = 4.0
+    use_native_edge_processor: bool = False
+    video_timestamp_mode: str = attrs.field(
+        default="qwen_index",
+        validator=attrs.validators.in_({"qwen_index", "legacy_fps", "source_pts"}),
+    )
+    qwen_video_temporal_mode: str = attrs.field(
+        default="native", validator=attrs.validators.in_({"native", "framewise"})
+    )
+    qwen_drop_over_max_length: bool = False
     text_chat_order: str = attrs.field(
         default="text_end",
         validator=attrs.validators.in_({"text_end", "text_start", "random"}),
     )
+    strip_thinking_prob: float = attrs.field(
+        default=0.0,
+        validator=attrs.validators.and_(
+            attrs.validators.instance_of((int, float)),
+            attrs.validators.ge(0.0),
+            attrs.validators.le(1.0),
+        ),
+    )
+    custom_system_prompt: str | None = "You are a helpful assistant."
+    strip_original_system_prompt: bool = False
     temporal_localization_output_format: str = attrs.field(
         default="random",
         validator=attrs.validators.in_({"dense_video_caption", "temporal_localization", "temporal_caption", "random"}),
@@ -50,9 +76,12 @@ class DataSetting:
     distributor_seed: int = 1993
     webdataset_detshuffle: bool = False
     num_data_workers: int = 8
-    data_prefetch_factor: int = 1
+    data_prefetch_factor: int | None = 1
     val_split_ratio: float = 0.0
     recipe_name: str | None = None
+    data_stats_writer_enabled: bool = False
+    lance_cache_manifest: str | None = None
+    lance_data_root: str | None = None
 
 
 @attrs.define(slots=False)

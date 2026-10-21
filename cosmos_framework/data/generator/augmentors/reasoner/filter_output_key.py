@@ -24,6 +24,7 @@ class FilterOutputKey(Augmentor):
             "input_ids",
             "token_mask",
             "attention_mask",
+            "mm_token_type_ids",
             "pixel_values_videos",
             "video_grid_thw",
             "second_per_grid_ts",
@@ -39,6 +40,8 @@ class FilterOutputKey(Augmentor):
             "pad_token_id",
             "ignore_index",
             "labels",
+            # CPU-only per-sample metadata consumed by DataStatsWriterCallback.
+            "data_stats",
         ],
         text_only: bool = False,
         args: Optional[dict] = None,

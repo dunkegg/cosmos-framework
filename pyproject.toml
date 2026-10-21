@@ -12,8 +12,8 @@ authors = [
   {name = "NVIDIA Corporation"},
 ]
 description = "Cosmos-Framework: Cosmos3 World Foundation Model (WFM)"
-requires-python = ">=3.10"
-license = {text = "OpenMDW-1.1"}
+requires-python = ">=3.10,<3.14"
+license = {text = "OpenMDW-1.1 AND Apache-2.0"}
 classifiers = [
   "Development Status :: 4 - Beta",
   "Environment :: GPU :: NVIDIA CUDA",
@@ -24,20 +24,31 @@ classifiers = [
 ]
 dependencies = [
   "accelerate",
-  "av",
+  # Imported by inference with COSMOS_TRAINING=0: inference.py (qwen-vl-utils), the multiview
+  # camera geometry (pyarrow) and the pretrained-model downloader (boto3).
+  "boto3",
+  # PyAV 18 preserves causal Transfer decode parity and requires Python >=3.11.
+  # Python 3.10 remains available for other runtimes; causal Transfer rejects it.
+  # hr_lr_degradation/codec.py calls VideoFrame.reformat(threads=...), added in PyAV 17;
+  # PyAV 18 (Python >=3.11) matches the imaginaire4 images the shared code is developed on.
+  "av>=17,<18; python_version < '3.11'",
+  "av>=18,<19; python_version >= '3.11'",
   "cattrs",
   "diffusers>=0.39.0",
   "einops",
   "hydra-core",
   "imageio-ffmpeg",
   "imageio",
+  "iopath>=0.1.10",
   "loguru",
   "msgpack",
   "nvidia-cudnn-frontend",
   "nvidia-ml-py",
   "obstore",
   "omegaconf",
+  "pyarrow",
   "pydantic",
+  "qwen-vl-utils",
   "requests",
   "scipy",
   "termcolor",
@@ -48,6 +59,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+automl = ["nvidia-automl-core==1.0.0.dev0"]
+automl-prompts = ["nvidia-automl-core[prompts]==1.0.0.dev0"]
+reasoner-eval = [
+  "attrs",
+  "evaluate",
+  "matplotlib",
+  "peft",
+  "pillow>=12.2.0",
+  "qwen-vl-utils",
+  "rouge-score",
+  "seaborn",
+  "toml",
+]
 guardrail = [
   "better-profanity",
   "nltk",
@@ -69,7 +93,6 @@ train = [
   "aiohttp",
   "arrgh",
   "blobfile",
-  "boto3",
   "botocore",
   "datasets",
   "dists-pytorch",
@@ -82,7 +105,6 @@ train = [
   "fvcore",
   "glfw",
   "h5py",
-  "iopath>=0.1.10",
   "imagecodecs",
   "ipycanvas",
   "ipyevents",
@@ -91,6 +113,7 @@ train = [
   "kornia",
   "lerobot",
   "librosa",
+  "liger-kernel>=0.8.3,<0.9",
   "lpips",
   "lz4",
   "matplotlib",
@@ -98,6 +121,7 @@ train = [
   "megatron-core",
   "more-itertools",
   "moviepy",
+  "mujoco==3.10.0", # Bimanual local ACT2 -> calibrated FK actions (no rendering).
   "multi-storage-client[boto3,google-cloud-storage,fsspec,observability-otel,vault]==0.44.0",
   "ninja",
   "nvidia-dali-cuda120",
@@ -122,7 +146,6 @@ train = [
   "python-memcached",
   "pytz",
   "pyyaml",
-  "qwen-vl-utils",
   "robotmq",
   "rsa",
   "s3fs",
@@ -147,6 +170,10 @@ train = [
 ]
 
 
+[project.scripts]
+cosmos-automl = "cosmos_framework.scripts.automl:main"
+cosmos-reasoner-evaluate = "cosmos_framework.evaluation.reasoner.evaluate:main"
+
 [dependency-groups]
 dev = [
   "hatch",
@@ -168,6 +195,8 @@ vllm = [
 ]
 # Match nvcr.io/nvidia/pytorch:25.11-py3: https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-01.html
 cu128 = [
+  # FA4 CuTeDSL kernels; the cu13 extra is only needed by CUDA 13 environments.
+  "flash-attn-4==4.0.0b24",
   "flash-attn-3-nv==1.0.3+cu128.torch210; platform_machine == 'x86_64'",
   "flash-attn==2.7.4.post1+cu128.torch210; platform_machine == 'x86_64'",
   "natten==0.21.6.dev6+cu128.torch210; platform_machine == 'x86_64'",
@@ -201,6 +230,8 @@ cu128-train = [
 ]
 # Match nvcr.io/nvidia/pytorch:25.11-py3: https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-11.html
 cu130 = [
+  # Match imaginaire4's FA4 installation on both x86_64 and aarch64.
+  "flash-attn-4[cu13]==4.0.0b24",
   "flash-attn-3-nv==1.0.3+cu130.torch210; platform_machine == 'x86_64'",
   "flash-attn==2.7.4.post1+cu130.torch210; platform_machine == 'x86_64'",
   # GB300/B300 (sm_103a): use the custom build that includes sm_103a kernels (both arches).
@@ -236,6 +267,7 @@ cu130-train = [
 ]
 # torch 2.13 on CUDA 13.0. Same layout as cu130 but pinned to torch 2.13.
 cu130-torch213 = [
+  "flash-attn-4[cu13]==4.0.0b24",
   #"flash-attn-3-nv==1.0.3+cu130.torch210; platform_machine == 'x86_64'", # TODO: torch213 build (cu130.torch210 wheels are cp313-only + torch210 ABI)
   #"flash-attn==2.7.4.post1+cu130.torch210; platform_machine == 'x86_64'", # TODO: torch213 build (cu130.torch210 wheels are cp313-only + torch210 ABI)
   # torch2.13 build (natten 0.21.6, sm 80/86/89/90/100/103/110/120/121) — matches this group's torch/ABI.
@@ -313,8 +345,20 @@ issues = "https://github.com/NVIDIA/cosmos-framework/issues"
 repository = "https://github.com/NVIDIA/cosmos-framework"
 
 [tool.uv]
-required-version = ">=0.11.3"
+# The lock is generated and checked with this exact resolver version in CI.
+# Keep the locked `uv` runtime dependency equal to it: the Posttrain guide
+# activates this project's venv, whose `uv` then runs that sync.
+required-version = "==0.11.29"
+constraint-dependencies = ["pydantic-extra-types==2.11.1", "uv==0.11.29"]
+# Development delivery of the optional AutoML engine is by independently built
+# local wheel, not an index. Keep its published extra requirements above intact,
+# but leave that engine out of the repository's uv-managed environment. Install
+# the supplied wheel explicitly after sync; use uv run --no-sync for AutoML.
+# Remove this exception once the core has an approved distribution location.
+exclude-dependencies = ["nvidia-automl-core"]
 conflicts = [
+  # Bimanual FK training and the LIBERO simulator require separate MuJoCo runtimes.
+  [{extra = "train"}, {group = "libero"}],
   [
     {group = "cu128"},
     {group = "cu128-train"},
@@ -346,6 +390,16 @@ required-environments = [
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
   "sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
+
+# These CUDA groups use CPython 3.13-only wheels (NATTEN, FlashAttention,
+# and Transformer Engine). Restrict the groups rather than the base package.
+[tool.uv.dependency-groups]
+cu128 = {requires-python = "==3.13.*"}
+cu128-train = {requires-python = "==3.13.*"}
+cu130 = {requires-python = "==3.13.*"}
+cu130-train = {requires-python = "==3.13.*"}
+cu130-torch213 = {requires-python = "==3.13.*"}
+cu130-torch213-train = {requires-python = "==3.13.*"}
 
 [tool.uv.sources]
 flash-attn = { index = "cosmos"}

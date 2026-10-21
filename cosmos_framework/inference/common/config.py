@@ -452,7 +452,7 @@ try:
     import cosmos_framework.model.generator  # noqa: F401
 
     CONFIG_REPLACEMENTS_INVERSE = [
-        # vlm → reasoner (upstream rename in i4). MUST precede the general vfm rules
+        # Legacy vlm → reasoner rename. MUST precede the general vfm rules
         # so the specific vlm→reasoner subtree isn't shadowed by them.
         (r"(?<!/)\bcosmos3/_src/vfm/configs/base/defaults/vlm/", r"cosmos_framework/configs/base/defaults/reasoner/"),
         (r"(?<!/)\bcosmos3/_src/vfm/configs/base/vlm/", r"cosmos_framework/configs/base/reasoner/"),
@@ -569,6 +569,15 @@ def apply_config_replacements(config_str: str) -> str:
 
 def undo_config_replacements(config_str: str) -> str:
     """Undo config replacements to a config string."""
+    # Some published checkpoints (e.g. cosmos3-super-i2v-fp8-14072026) carry a
+    # config.json dumped straight from the internal tree, so it still names
+    # ``projects.cosmos3.vfm.*`` / ``imaginaire.*`` instead of the ``cosmos3._src.*``
+    # form the release rewrite produces. Normalize to that form first so the
+    # inverse table below sees what it expects; already-rewritten configs are
+    # unaffected (the patterns cannot match ``cosmos3._src.*``).
+    for pattern, repl in CONFIG_REPLACEMENTS:
+        config_str = re.sub(pattern, repl, config_str)
+
     for pattern, repl in CONFIG_REPLACEMENTS_INVERSE:
         config_str = re.sub(pattern, repl, config_str)
 

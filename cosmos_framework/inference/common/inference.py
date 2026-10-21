@@ -23,6 +23,9 @@ if TYPE_CHECKING:
     from cosmos_framework.auxiliary.guardrail.common.core import GuardrailRunner
 
 
+PreparedBatch = tuple[list[SampleArgs], dict[str, Any]] | SampleOutputs
+
+
 def _download_on_rank0(download: Callable[[], str | Path]) -> Path:
     """Download once and share the resulting path across distributed ranks."""
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
@@ -78,15 +81,25 @@ def sync_distributed_errors():
 @dataclass
 class GuardrailRunners:
     text: "GuardrailRunner"
-    video: "GuardrailRunner"
+    video: "GuardrailRunner | None"
 
     @classmethod
-    def create(cls, args: GuardrailArgs, /) -> Self:
+    def create(cls, args: GuardrailArgs, /, *, include_video: bool = True) -> Self:
+        """Build the guardrail runners.
+
+        ``include_video=False`` skips the video runner entirely (its RetinaFace
+        weights are ~109 MB of otherwise idle GPU memory). Reasoner-only runs use
+        it because they never produce frames; every other caller keeps the default.
+        """
         from cosmos_framework.auxiliary.guardrail.common import presets
 
         return cls(
             text=presets.create_text_guardrail_runner(offload_model_to_cpu=args.offload_guardrail_models),
-            video=presets.create_video_guardrail_runner(offload_model_to_cpu=args.offload_guardrail_models),
+            video=(
+                presets.create_video_guardrail_runner(offload_model_to_cpu=args.offload_guardrail_models)
+                if include_video
+                else None
+            ),
         )
 
 
@@ -112,10 +125,8 @@ class Inference(ABC):
         """Create instance."""
 
     @abstractmethod
-    def create_batches(
-        self, sample_args_list: Sequence[SampleArgs]
-    ) -> Iterator[tuple[list[SampleArgs], dict[str, Any]]]:
-        """Create batches of sample data."""
+    def create_batches(self, sample_args_list: Sequence[SampleArgs]) -> Iterator[PreparedBatch]:
+        """Yield prepared batches or receipts for individual input failures."""
 
     @abstractmethod
     def generate_batch(
@@ -132,7 +143,11 @@ class Inference(ABC):
     def create(cls, setup_args: SetupArgs, /) -> Self:
         """Create instance."""
         timer = TrainingTimer() if setup_args.benchmark else None
-        guardrails = GuardrailRunners.create(setup_args) if setup_args.guardrails else None
+        guardrails = (
+            GuardrailRunners.create(setup_args, include_video=setup_args.video_guardrail)
+            if setup_args.guardrails
+            else None
+        )
         return cls._create(setup_args, guardrails=guardrails, _timer=timer)
 
     @torch.no_grad()
@@ -148,7 +163,11 @@ class Inference(ABC):
 
         # Generate batches
         sample_outputs: list[SampleOutputs] = []
-        for i_batch, (sample_args_batch, data_batch) in enumerate(batches):
+        for i_batch, batch in enumerate(batches):
+            if isinstance(batch, SampleOutputs):
+                sample_outputs.append(batch)
+                continue
+            sample_args_batch, data_batch = batch
             log.debug(f"[{i_batch + 1}] Processing batch", rank0_only=False)
 
             if self.setup_args.profile:
@@ -284,6 +303,10 @@ class Inference(ABC):
         """Run guardrail checks on the video and apply face blur."""
         if self.guardrails is None:
             return video_cthw
+        assert self.guardrails.video is not None, (
+            "The video guardrail runner was not built (include_video=False), but a sample "
+            "produced frames. Only reasoner-only runs may skip it — this is a policy bug."
+        )
         processed_video_cthw, message = _run_video_guardrail(self.guardrails.video, video_cthw)
         if processed_video_cthw is None:
             raise ValueError(f"Guardrail blocked video '{name}': {message}")

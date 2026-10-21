@@ -61,6 +61,7 @@ class Checkpointer:
         scheduler: torch.optim.lr_scheduler.LRScheduler,
         grad_scaler: torch.amp.GradScaler,
         iteration: int,
+        epoch: int | None = None,
     ) -> None:
         """Save network weights, optimizer parameters, scheduler parameters to a checkpoint.
 
@@ -73,7 +74,7 @@ class Checkpointer:
         """
         self.callbacks.on_save_checkpoint_start(model, iteration)
 
-        checkpoint_file = f"iter_{iteration:09}.pt"
+        checkpoint_file = f"epoch_{epoch}.pt" if epoch is not None else f"iter_{iteration:09}.pt"
 
         if distributed.get_rank() == 0:
             state_dict = dict(
@@ -100,6 +101,14 @@ class Checkpointer:
         # Please check logs from on_save_checkpoint_success() for better accuracy
         self.callbacks.on_save_checkpoint_end(model=None, iteration=iteration)
 
+    def poll_async_save(self) -> None:
+        """Nothing to poll: the save worker dispatches ``on_save_checkpoint_success`` itself.
+
+        Mirrors :meth:`cosmos_framework.checkpoint.base.AbstractCheckpointer.poll_async_save`, which
+        this class predates and does not inherit, so
+        :class:`cosmos_framework.utils.callback.ConfirmAsyncCheckpoint` can call it unconditionally.
+        """
+
     @misc.timer("checkpoint saving (local)")
     def _save_worker_local(self, state_dict: dict[str, torch.Tensor], checkpoint_file: str, rank: int = 0) -> None:
         """Worker to save checkpoint to local disk, spawned with a child thread (runs in parallel with the training).
@@ -116,7 +125,7 @@ class Checkpointer:
             if rank == 0:
                 self._write_latest_checkpoint_file(checkpoint_file)
             log.success(f"Saved checkpoint (local): {checkpoint_path}")
-            iteration = int(checkpoint_file.replace("iter_", "").replace(".pt", ""))
+            iteration = int(state_dict["iteration"])
             self.callbacks.on_save_checkpoint_success(iteration=iteration)
         except Exception as e:  # noqa: BLE001
             log.exception(f"Checkpoint failed to save (local): {e}")
@@ -138,7 +147,7 @@ class Checkpointer:
             if rank == 0:
                 self._write_latest_checkpoint_file(checkpoint_file)
             log.success(f"Saved checkpoint (object store): {checkpoint_path}")
-            iteration = int(checkpoint_file.replace("iter_", "").replace(".pt", ""))
+            iteration = int(state_dict["iteration"])
             self.callbacks.on_save_checkpoint_success(iteration=iteration)
         except Exception as e:  # noqa: BLE001
             log.exception(f"Checkpoint failed to upload (object store): {e}")
@@ -305,6 +314,7 @@ class MultiRankCheckpointer(Checkpointer):
         scheduler: torch.optim.lr_scheduler.LRScheduler,
         grad_scaler: torch.amp.GradScaler,
         iteration: int,
+        epoch: int | None = None,
     ) -> None:
         """Save network weights, optimizer parameters, scheduler parameters to a checkpoint.
 
@@ -317,7 +327,7 @@ class MultiRankCheckpointer(Checkpointer):
         """
         # checkpoint_file = f"iter_{iteration:09}.pt"
         postfix, _, total_ema_num = model.get_ckpt_postfix()
-        checkpoint_file = f"iter_{iteration:09}{postfix}.pt"
+        checkpoint_file = f"epoch_{epoch}{postfix}.pt" if epoch is not None else f"iter_{iteration:09}{postfix}.pt"
         save_ranks = list(range(total_ema_num))
         for _rank in save_ranks:
             if distributed.get_rank() == _rank:

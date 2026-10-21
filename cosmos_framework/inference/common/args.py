@@ -337,6 +337,45 @@ class ConfigFileType(StrEnum):
         raise ValueError(f"Invalid config file: {path}")
 
 
+def _hf_config_has_model_section(config_path: Path) -> bool:
+    """Return whether an HF 'config.json' carries the Cosmos3 'model' section."""
+    try:
+        config_dict = json.loads(config_path.read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(config_dict, dict) and isinstance(config_dict.get("model"), dict)
+
+
+def _hf_repository_from_checkpoint_dir(checkpoint_dir: Path) -> str | None:
+    """Recover the Hugging Face repository a local checkpoint directory was published under.
+
+    'convert_model_to_diffusers' stamps every component in
+    'modular_model_index.json' with the source repo id. Unlike the directory
+    name it survives a copy or rename, so it is the only dependable way to map a
+    downloaded checkpoint directory back onto its registry entry.
+
+    Returns None when the file is absent, unreadable, or does not agree on a
+    single repository.
+    """
+    try:
+        index = json.loads((checkpoint_dir / "modular_model_index.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(index, dict):
+        return None
+    repositories = {
+        component[2]["pretrained_model_name_or_path"]
+        for component in index.values()
+        if isinstance(component, list)
+        and len(component) == 3
+        and isinstance(component[2], dict)
+        and isinstance(component[2].get("pretrained_model_name_or_path"), str)
+    }
+    if len(repositories) != 1:
+        return None
+    return repositories.pop()
+
+
 def _validate_config_file(v: str) -> str:
     config_file_type = ConfigFileType.from_path(v)
     if config_file_type == ConfigFileType.MODULE:
@@ -353,6 +392,26 @@ def _validate_config_file(v: str) -> str:
 ConfigFile = Annotated[str, pydantic.AfterValidator(_validate_config_file)]
 
 
+def _normalize_dotlist_overrides(overrides: list[str]) -> list[str]:
+    """Normalize Tyro list-string dotlist overrides.
+
+    Tyro parses ``--experiment-overrides "[a=b]"`` as a single string that
+    still includes the brackets. Convert that documented form to the dotlist
+    entries OmegaConf expects.
+    """
+    normalized = []
+    for override_str in overrides:
+        stripped = override_str.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            parsed = OmegaConf.create(stripped)
+            if not isinstance(parsed, omegaconf.ListConfig):
+                raise ValueError(f"Expected bracketed experiment override list, got {override_str!r}")
+            normalized.extend(str(item) for item in parsed)
+        else:
+            normalized.append(override_str)
+    return normalized
+
+
 class ConfigArgs(ArgsBase):
     config_file: ConfigFile
     config_file_type: ConfigFileType
@@ -363,12 +422,13 @@ class ConfigArgs(ArgsBase):
         """Load Hydra config."""
         from cosmos_framework.inference.common.config import load_config
 
+        experiment_overrides = _normalize_dotlist_overrides(self.experiment_overrides)
         match self.config_file_type:
             case ConfigFileType.MODULE:
-                return load_config(self.config_file, self.experiment, overrides=self.experiment_overrides)
+                return load_config(self.config_file, self.experiment, overrides=experiment_overrides)
             case ConfigFileType.YAML | ConfigFileType.JSON:
                 config_dict = deserialize_config_dict(Path(self.config_file))
-                overrides_omegaconf = OmegaConf.from_dotlist(self.experiment_overrides)
+                overrides_omegaconf = OmegaConf.from_dotlist(experiment_overrides)
                 config_omegaconf = OmegaConf.merge(config_dict, overrides_omegaconf)
                 config = structure_config(config_omegaconf)
                 assert isinstance(config, Config)
@@ -383,7 +443,20 @@ class ConfigArgs(ArgsBase):
                 return unstructure_config(self.load_config().model)
             case ConfigFileType.YAML | ConfigFileType.JSON:
                 config_dict = deserialize_config_dict(Path(self.config_file))
-                overrides_omegaconf = OmegaConf.from_dotlist(self.experiment_overrides)
+                # Check for 'model' before merging: 'experiment_overrides' are
+                # dotlists rooted at 'model.', so merging first synthesizes a
+                # 'model' section out of the overrides alone. That defeats the
+                # guard in 'load_model_config_from_hf_config' and turns a
+                # missing architecture into a much later, opaque failure deep in
+                # model construction (e.g. omegaconf "Missing key ema").
+                if "model" not in config_dict:
+                    raise KeyError(
+                        f"Config file has no 'model' section, so it does not describe a Cosmos3 model "
+                        f"architecture: {self.config_file}. Pass '--config-file' with a Cosmos3 model config "
+                        f"(e.g. one of 'cosmos_framework/inference/configs/model/*.yaml')."
+                    )
+                experiment_overrides = _normalize_dotlist_overrides(self.experiment_overrides)
+                overrides_omegaconf = OmegaConf.from_dotlist(experiment_overrides)
                 config_dict = OmegaConf.to_container(OmegaConf.merge(config_dict, overrides_omegaconf), resolve=False)
                 assert isinstance(config_dict, dict)
                 return load_model_config_from_hf_config(config_dict)
@@ -431,8 +504,7 @@ class CheckpointType(StrEnum):
         transformer_path = path / "transformer"
         has_root_hf_weights = any(path.glob("*.safetensors")) or any(path.glob("*.safetensors.index.json"))
         has_diffusers_hf_weights = (path / "model_index.json").is_file() and (
-            any(transformer_path.glob("*.safetensors"))
-            or any(transformer_path.glob("*.safetensors.index.json"))
+            any(transformer_path.glob("*.safetensors")) or any(transformer_path.glob("*.safetensors.index.json"))
         )
         has_hf_weights = has_root_hf_weights or has_diffusers_hf_weights
         if has_hf_weights:
@@ -554,6 +626,55 @@ class CheckpointOverrides(ConfigOverrides):
     checkpoint_cache_dir: Training[Path | None] = None
     """Directory for caching S3 checkpoints."""
 
+    def _resolve_local_hf_config_file(self, checkpoint_dir: Path, *, checkpoints: dict[str, CheckpointConfig]) -> None:
+        """Point 'config_file' at the model config for a local HF checkpoint directory.
+
+        A copy of a registered repository resolves to that entry's model config,
+        the same one a registered '--checkpoint-path' name resolves to. The two
+        spellings of the same checkpoint must not resolve differently, and the
+        registered config is the authority: a published repository's own
+        'config.json' can be an older snapshot of the architecture
+        (nvidia/Cosmos3-Nano omits 'include_visual' and names the text-only
+        processor) or carry no 'model' section at all (nvidia/Cosmos3-Edge).
+
+        Anything else falls back to the directory's own 'config.json', which is
+        the only description available for a checkpoint we do not publish.
+        """
+        repository = _hf_repository_from_checkpoint_dir(checkpoint_dir)
+        registered = next(
+            (checkpoint for checkpoint in checkpoints.values() if checkpoint.hf.repository == repository),
+            None,
+        )
+        if registered is not None:
+            # Adopt the registry entry's architecture and load-time settings, but
+            # not its 'hf' download spec: the weights are the local directory.
+            self.config_file = registered.config_file
+            self.model_memory_bytes = registered.model_memory_bytes
+            self.vlm_processor_from_checkpoint = registered.vlm_processor_from_checkpoint
+            for value in reversed(registered.experiment_overrides):
+                if value not in self.experiment_overrides:
+                    self.experiment_overrides.insert(0, value)
+            return
+
+        local_config = checkpoint_dir / "config.json"
+        if _hf_config_has_model_section(local_config):
+            self.config_file = str(local_config)
+            return
+
+        known = ", ".join(sorted(checkpoints)) or "<none>"
+        raise ValueError(
+            f"Could not determine which model config describes checkpoint directory: {checkpoint_dir}. "
+            f"Its 'config.json' has no 'model' section, and "
+            + (
+                f"the repository it records ({repository}) is not a registered checkpoint."
+                if repository is not None
+                else "it records no source repository to match against a registered checkpoint."
+            )
+            + f" Registered checkpoints: {known}. Pass '--config-file' with the Cosmos3 model config that "
+            f"matches this checkpoint (one of 'cosmos_framework/inference/configs/model/*.yaml'), or pass "
+            f"a registered checkpoint name as '--checkpoint-path'."
+        )
+
     def _build_checkpoint(self, checkpoints: dict[str, CheckpointConfig]):
         # Detect checkpoint type
         if self.checkpoint_path in checkpoints:
@@ -582,17 +703,13 @@ class CheckpointOverrides(ConfigOverrides):
                 checkpoint_dir = checkpoint_dir / "model"
             self.checkpoint_path = str(checkpoint_dir)
             self.checkpoint_type = CheckpointType.from_path(checkpoint_dir)
-            # Local HF dir with no explicit --config-file: fall back to the
-            # dir's own config.json (mirrors the registry branch and
-            # from_pretrained_dcp). Without this, config_file stays at the
-            # default .py module, which needs a Hydra experiment that a local
-            # HF dir cannot supply -> MissingConfigException("experiment/").
-            if (
-                self.checkpoint_type == CheckpointType.HF
-                and self.config_file == DEFAULT_CONFIG_FILE
-                and (checkpoint_dir / "config.json").is_file()
-            ):
-                self.config_file = str(checkpoint_dir / "config.json")
+            # Local HF dir with no explicit --config-file: resolve the same
+            # registered model config the registry branch above would use. Left
+            # alone, config_file stays at the default .py module, which needs a
+            # Hydra experiment that a local HF dir cannot supply ->
+            # MissingConfigException("experiment/").
+            if self.checkpoint_type == CheckpointType.HF and self.config_file == DEFAULT_CONFIG_FILE:
+                self._resolve_local_hf_config_file(checkpoint_dir, checkpoints=checkpoints)
         self.config_file_type = ConfigFileType.from_path(self.config_file)
 
         if self.checkpoint_type == CheckpointType.DCP and self.config_file_type == ConfigFileType.MODULE:
@@ -624,36 +741,74 @@ class CheckpointOverrides(ConfigOverrides):
 
 ParallelismPreset = Literal["throughput", "latency"]
 CfgpSize = Annotated[int, pydantic.Field(ge=1, le=2)]
+AttentionIOLayout = Literal["sequence_sharded", "replicated"]
 CompiledRegion = Literal["all", "language"]
+CudaGraphScope = Literal["block", "forward"]
+ARPostSaturationMode = Literal[
+    "default",
+    "static-compile",
+    "cuda-graph",
+]
 
 # Low-precision quantization method to apply to the model at load time.
-# One of ``mxfp8`` / ``nvfp4``, or ``None`` (default) to disable.
+# One of ``mxfp8`` / ``nvfp4`` / ``fp8``, or ``None`` (default) to disable.
 # Routed to the VFM model loader, which selects an FSDP-compatible
 # (module-swap) path when sharded (``dp_shard_size > 1``) and an in-place
-# path when replicated (``dp_shard_size == 1``). Note ``mxfp8`` / ``nvfp4``
-# are only supported on the replicated path.
-QuantizationMethod = Literal["mxfp8", "nvfp4"]
+# path when replicated (``dp_shard_size == 1``). All methods are only
+# supported on the replicated path. ``mxfp8`` / ``nvfp4`` require Blackwell
+# (sm_100); ``fp8`` (e4m3 dynamic-activation + fp8-weight) also runs on
+# Hopper (sm_90) and Ada (sm_89).
+QuantizationMethod = Literal["mxfp8", "nvfp4", "fp8"]
+
+# Scaling granularity for the ``fp8`` method: ``per_row`` (rowwise scales,
+# better accuracy) or ``per_tensor`` (single scale per tensor, slightly
+# faster). Ignored by ``mxfp8`` / ``nvfp4``, which use fixed block-scaled formats.
+QuantizationGranularity = Literal["per_row", "per_tensor"]
 
 
 class QuantizationArgs(ArgsBase):
     """Low-precision quantization arguments applied to the model at load time."""
 
     quantization_method: QuantizationMethod | None
+    quantization_fp8_granularity: QuantizationGranularity
     quantization_include_regex: list[str]
     quantization_exclude_regex: list[str]
+    mixed_precision_first_steps: int
+    mixed_precision_last_steps: int
+    mixed_precision_reasoner_policy: Literal["high_precision", "base_precision"]
+    mixed_precision_w8a16_cache: Literal["none", "generation", "all", "cpu_block", "gpu_block"]
 
 
 class QuantizationOverrides(OverridesBase):
     quantization_method: QuantizationMethod | None = None
-    """Quantization method (``mxfp8`` / ``nvfp4``), or ``None`` to disable.
+    """Quantization method (``mxfp8`` / ``nvfp4`` / ``fp8``), or ``None`` to disable.
 
     Post-training quantization (PTQ) is applied in-place to the model at load
-    time. Only supported on Blackwell architectures and when FSDP sharding is disabled.
+    time, only when FSDP sharding is disabled. ``mxfp8`` / ``nvfp4`` require
+    Blackwell architectures; ``fp8`` also runs on Hopper (sm_90) and Ada (sm_89).
     """
+    quantization_fp8_granularity: QuantizationGranularity = "per_row"
+    """Scaling granularity for the ``fp8`` method: ``per_row`` (rowwise, better
+    accuracy) or ``per_tensor`` (single scale, slightly faster). Ignored by
+    ``mxfp8`` / ``nvfp4``."""
     quantization_include_regex: list[str] = ["language_model.model.layers"]
     """Regexes matched against module FQNs; a Linear is quantized only if it matches one (empty = all)."""
     quantization_exclude_regex: list[str] = pydantic.Field(default_factory=list)
     """Regexes matched against module FQNs; a Linear is skipped if it matches any."""
+    mixed_precision_first_steps: int = pydantic.Field(default=0, ge=0)
+    """ModelOpt FP8 checkpoints only: run the first N diffusion steps with 16-bit
+    activations (W8A16) instead of FP8 activations (W8A8). 0 disables."""
+    mixed_precision_last_steps: int = pydantic.Field(default=0, ge=0)
+    """ModelOpt FP8 checkpoints only: run the last N diffusion steps with W8A16."""
+    mixed_precision_reasoner_policy: Literal["high_precision", "base_precision"] = "high_precision"
+    """Understanding-pathway precision when mixed precision is enabled:
+    high_precision keeps reasoner linears on W8A16 for every step."""
+    mixed_precision_w8a16_cache: Literal["none", "generation", "all", "cpu_block", "gpu_block"] = "none"
+    """W8A16 dense-weight source: none (default) dequantizes per call and works
+    everywhere, including FSDP-sharded runs, at wall time indistinguishable from
+    the cached modes; generation/all hold resident BF16 caches; gpu_block/
+    cpu_block stream per-layer double buffers. FSDP-sharded runs support only
+    none."""
 
     def build_quantization(self) -> QuantizationArgs:
         return self._build(QuantizationArgs)
@@ -666,12 +821,17 @@ class ParallelismArgs(ArgsBase):
     dp_shard_size: pydantic.PositiveInt
     tp_size: pydantic.PositiveInt
     cp_size: pydantic.PositiveInt
+    attention_io_layout: AttentionIOLayout
     cfgp_size: CfgpSize
     use_torch_compile: bool
     use_cuda_graphs: bool
+    cuda_graph_scope: CudaGraphScope
     compiled_region: CompiledRegion
     compile_dynamic: bool
+    ar_post_saturation_mode: ARPostSaturationMode
     use_separate_pipeline_vision_decode_gpu: bool
+    use_vae_encode_compile: bool
+    use_vae_decode_compile: bool
 
     @property
     def world_size(self) -> int:
@@ -698,6 +858,16 @@ class ParallelismOverrides(OverridesBase):
     """Tensor parallel size."""
     cp_size: pydantic.NonNegativeInt = 1
     """Context parallel size."""
+    attention_io_layout: AttentionIOLayout = "sequence_sharded"
+    """Tensor layout at the attention boundary under context parallelism.
+
+    Both layouts can execute the attention kernel with head-sharded Q/K/V.
+    ``sequence_sharded`` keeps surrounding projections/MLP on sequence shards
+    and uses Ulysses-style all-to-all before and after attention.
+    ``replicated`` keeps current-frame hidden states replicated, slices local
+    heads directly before attention, then reduces/gathers attention output so
+    surrounding ops see replicated hidden states.
+    """
     cfgp_size: CfgpSize | Literal[0] = 1
     """CFG (Classifier Free Guidance) parallel size.
 
@@ -709,6 +879,9 @@ class ParallelismOverrides(OverridesBase):
     """Whether to use torch compile."""
     use_cuda_graphs: bool = True
     """Whether to use CUDA graphs."""
+    cuda_graph_scope: CudaGraphScope = "block"
+    """CUDA-graph granularity for AR inference: "block" = one inductor CUDA-graph tree per decoder
+    block; "forward" = one explicit graph per whole AR forward (static-shape KV path)."""
     compiled_region: CompiledRegion = "all"
     """Torch compile region."""
     compile_dynamic: bool = True
@@ -719,10 +892,35 @@ class ParallelismOverrides(OverridesBase):
     kernels when the shapes are stable (e.g. single-prompt AR inference), at
     the cost of a recompile on shape change.
     """
+    ar_post_saturation_mode: ARPostSaturationMode = "default"
+    """AR inference post-saturation execution mode.
+
+    ``default`` preserves the global ``use_torch_compile`` / ``use_cuda_graphs``
+    behavior. ``static-compile`` keeps that behavior before the rolling KV window
+    saturates, then routes AR decoder layers through a separate static
+    torch.compile path after saturation. ``cuda-graph`` additionally captures
+    coarse full-model denoise and KV-refresh graphs after saturation.
+    """
     use_separate_pipeline_vision_decode_gpu: bool = False
     """Whether to place pipeline vision decode on a spare local GPU when one is available."""
+    use_vae_encode_compile: bool = False
+    """AOT-compile Wan VAE encoder chunks at startup for --resolution and --aspect-ratio.
+
+    Other input shapes fall back to eager encoding. Startup compilation is best amortized
+    over multiple samples in the same process. Independent of --use-torch-compile.
+    """
+    use_vae_decode_compile: bool = False
+    """Statically compile steady-state Wan VAE decoder slices on first use.
+
+    Independent of --use-torch-compile; disabled by default to avoid first-video overhead.
+    """
 
     def _build_parallelism(self, world_size: int | None, local_world_size: int | None, device_memory_bytes: int | None):
+        if self.use_vae_encode_compile and self.use_separate_pipeline_vision_decode_gpu:
+            raise ValueError(
+                "--use-vae-encode-compile binds the encoder to this rank's GPU and cannot be combined with "
+                "--use-separate-pipeline-vision-decode-gpu."
+            )
         if not self.dp_replicate_size:
             self.dp_replicate_size = 1
         if not self.dp_shard_size:
@@ -748,6 +946,18 @@ class GuardrailArgs(ArgsBase):
 
     guardrails: bool
     offload_guardrail_models: bool
+    video_guardrail: bool = pydantic.Field(default=True, exclude=True)
+    """Build the video guardrail runner.
+
+    Runtime-only policy field. It has no ``GuardrailOverrides`` counterpart on
+    purpose: exposing a CLI flag that disables face blurring for generative runs
+    would be a safety footgun, so only the reasoner-only path sets it False.
+
+    ``exclude=True`` keeps it out of ``model_dump()`` because ``SetupArgs`` dumps
+    must round-trip back through ``SetupOverrides``, which forbids extra keys
+    (see ``args_test.test_setup_args``). Anything that rebuilds args from a dump
+    therefore gets the safe default of building the runner.
+    """
 
 
 class GuardrailOverrides(OverridesBase):
@@ -768,6 +978,11 @@ class SetupArgs(ABC, CheckpointArgs, ParallelismArgs, QuantizationArgs, Guardrai
     num_iterations: pydantic.PositiveInt
     max_model_len: pydantic.PositiveInt | None
     max_num_seqs: pydantic.PositiveInt | None
+    use_batched_cfg: bool
+    diffusion_cache: bool
+    diffusion_cache_thresh: float | None
+    diffusion_cache_residual_order: int | None
+    diffusion_cache_max_consecutive_cached: pydantic.NonNegativeInt | None
 
     # Subclass must implement these fields/methods
     # ------------------------------------------------------------
@@ -799,7 +1014,9 @@ class SetupOverrides(ABC, CheckpointOverrides, ParallelismOverrides, Quantizatio
     output_dir: Annotated[ResolvedPath | None, tyro.conf.arg(aliases=("-o",))] = None
     """Output directory."""
     keep_going: bool = False
-    """If True, catch and log errors instead of raising them."""
+    """Continue after per-sample errors. Input preparation failures write a
+    status='error' sample_outputs.json; valid samples in later batches still run.
+    Unexpected runtime/CUDA errors during input preparation remain fatal."""
     skip_invalid_samples: bool = False
     """If True, skip samples whose modality (e.g. action, sound) is not supported by the
     loaded model and emit a ``status='skip'`` output instead of raising. Useful for tests
@@ -820,6 +1037,35 @@ class SetupOverrides(ABC, CheckpointOverrides, ParallelismOverrides, Quantizatio
     max_num_seqs: pydantic.PositiveInt | None = 1
     """Maximum number of sequences per batch.  When set, samples are packed into
     batches by number of sequences."""
+    use_batched_cfg: bool = False
+    """Run conditional and unconditional CFG branches as a single batched forward of
+    size 2N instead of two sequential N-forwards. Disabled by default because
+    long or high-resolution workloads can already saturate the GPU and batching
+    increases peak activation memory. Enable with ``--use-batched-cfg`` for
+    underutilized workloads. It is automatically disabled with a warning when
+    cfg-parallel (``cfgp_size > 1``) is selected."""
+    diffusion_cache: bool = False
+    """Enable the diffusion-time inference cache.
+    Shared inference setup disables the cache by default. The inference CLI enables
+    it by default; pass ``--no-diffusion-cache`` to disable it. Caching is based on
+    SeaCache: Spectral-Evolution-Aware Cache for Accelerating Diffusion Models
+    (https://arxiv.org/abs/2602.18993). Autoregressive and KV-cache generation
+    bypass the cache automatically. Quantized inference (ModelOpt FP8 checkpoints,
+    ``--quantization-method`` mxfp8/nvfp4/fp8) follows the same cache setting.
+    """
+    diffusion_cache_thresh: float | None = None
+    """Accumulated relative-L1 threshold (``diffusion_cache_thresh``), shared by the
+    conditional and unconditional pathways. Larger values allow more skipping at
+    the cost of lower fidelity. ``None`` uses the ``DiffusionCache.Config`` default
+    (0.25). Only takes effect when diffusion cache is enabled."""
+    diffusion_cache_residual_order: int | None = None
+    """Polynomial order for extrapolating the generation residual on a skipped step via
+    Newton divided differences: 0 = constant reuse, 1 = linear, 2 = quadratic.
+    ``None`` uses the default (1).  Only used when diffusion cache is enabled."""
+    diffusion_cache_max_consecutive_cached: pydantic.NonNegativeInt | None = None
+    """Maximum consecutive residual reuses per CFG pathway before forcing a full
+    evaluation. ``0`` disables the limit and ``None`` uses the cache default (2).
+    Only used when diffusion cache is enabled."""
 
     def _build_setup(self):
         if self.num_iterations > 1 and not self.benchmark:
@@ -911,6 +1157,24 @@ class SampleOverrides(OverridesBase):
     @abstractmethod
     def build_sample(self, *, model_config: Any) -> SampleArgs:
         """Build sample arguments."""
+
+
+def sample_output_dir(root: Path, name: str) -> Path:
+    """Keep sample downloads and artifacts within the requested output root.
+
+    ``name`` is a relative POSIX path. Nested names such as ``inference_prompt/episode`` are kept
+    (published SFT validation prompts use them), but absolute paths, ``.``/``..`` and empty
+    components, backslashes and NUL bytes are rejected, and the resolved directory (following any
+    existing symlinks) must stay under ``root``.
+    """
+    if not name or "\\" in name or "\x00" in name or name.startswith("/"):
+        raise ValueError(f"Sample name must be a nonempty relative path, got {name!r}.")
+    if any(part in {"", ".", ".."} for part in name.split("/")):
+        raise ValueError(f"Sample name must not contain empty, '.' or '..' path components, got {name!r}.")
+    destination = root / name
+    if not destination.resolve().is_relative_to(root.resolve()):
+        raise ValueError(f"Sample output directory for {name!r} resolves outside the requested output root.")
+    return destination
 
 
 def _deep_merge(base: dict, overrides: dict) -> dict:

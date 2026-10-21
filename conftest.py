@@ -7,13 +7,21 @@ from cosmos_framework.utils.lazy_config import lazy_call
 lazy_call._CONVERT_TARGET_TO_STRING = True
 
 import gc
+import json
 import os
 from functools import cache
 from pathlib import Path
 
 import pytest
 
-from cosmos_framework.inference.fixtures.args import ALL_LEVELS, ALL_NUM_GPUS, ALLOWED_GPUS_BY_LEVEL, Args, get_args, init_args
+from cosmos_framework.inference.fixtures.args import (
+    ALL_LEVELS,
+    ALL_NUM_GPUS,
+    ALLOWED_GPUS_BY_LEVEL,
+    Args,
+    get_args,
+    init_args,
+)
 
 
 @pytest.fixture(scope="module")
@@ -39,6 +47,12 @@ def _get_available_gpus() -> int:
 
 def pytest_addoption(parser: pytest.Parser):
     parser.addoption("--manual", action="store_true", default=False, help="Run manual tests")
+    parser.addoption(
+        "--skip-mapped-non-gpu-tests",
+        action="store_true",
+        default=False,
+        help="Skip tests generated from imaginaire4 unless they explicitly require a GPU.",
+    )
     parser.addoption(
         "--num-gpus",
         default=None,
@@ -129,13 +143,26 @@ def _parse_gpus_marker(mark: pytest.Mark) -> int:
     return required_gpus
 
 
+@cache
+def _mapped_destinations(root_dir: Path) -> frozenset[str]:
+    """Return repository-relative files generated from imaginaire4 sources."""
+    payload = json.loads((root_dir / ".file_mapping.json").read_text())
+    files = payload.get("files", payload)
+    if not isinstance(files, dict) or any(not isinstance(path, str) for path in files.values()):
+        raise TypeError(".file_mapping.json must contain a string-to-string files mapping.")
+    return frozenset(files.values())
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]):
     args = get_args()
+    skip_mapped_non_gpu_tests = bool(config.getoption("--skip-mapped-non-gpu-tests"))
+    mapped_destinations = _mapped_destinations(config.rootpath) if skip_mapped_non_gpu_tests else frozenset()
 
     for item in items:
         manual_mark = _get_marker(item, "manual")
         level_mark = _get_marker(item, "level")
         gpus_mark = _get_marker(item, "gpus")
+        gpu_mark = _get_marker(item, "GPU")
         try:
             level = _parse_level_marker(level_mark) if level_mark else 0
             gpus = _parse_gpus_marker(gpus_mark) if gpus_mark else 0
@@ -159,6 +186,10 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(
                 pytest.mark.skip(reason=f"test requires {gpus} GPUs, but only {available_gpus} are available")
             )
+        if skip_mapped_non_gpu_tests and gpu_mark is None and gpus == 0:
+            item_path = Path(str(item.path)).relative_to(config.rootpath).as_posix()
+            if item_path in mapped_destinations:
+                item.add_marker(pytest.mark.skip(reason="mapped non-GPU test is covered by imaginaire4 CI"))
 
     # Exclude skipped tests
     selected_items = []
@@ -199,6 +230,14 @@ def pytest_runtest_setup(item: pytest.Item):
         device_end = device_start + gpus
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, range(device_start, device_end)))
         os.environ["NUM_GPUS"] = str(gpus)
+
+        # A test that asks for whole GPUs gets their whole memory. Stated rather than left
+        # alone because the fraction below is process-global and outlives the test that set
+        # it: without this, a gpus(n) test inherits the 1/N budget of whichever unmarked test
+        # happened to run before it in this process, which in a whole-suite run is all of them.
+        os.environ["DEVICE_MEMORY_FRACTION"] = "1"
+        if torch.cuda.is_available():
+            torch.cuda.set_per_process_memory_fraction(1.0)
     else:
         device = 0
         os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
@@ -247,7 +286,6 @@ def init_torch_test():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
 
 
 _WHITELIST_ENV_VARS = {

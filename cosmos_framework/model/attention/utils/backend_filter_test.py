@@ -63,26 +63,28 @@ class TestParseBackendFilter(unittest.TestCase):
         result = parse_backend_filter("-flash2,-invalid_backend", default)
         assert result == ["natten", "cudnn"]  # flash2 removed, invalid_backend ignored with warning
 
-    @pytest.mark.xfail(raises=ValueError, strict=True)
     def test_error_mixing_bans_and_allows(self):
         """Test that mixing bans and allows raises an error."""
         default = ["flash2", "natten", "cudnn"]
         # This should raise ValueError about mixing ban-list and allow-list
-        parse_backend_filter("-flash2,natten", default)
+        with pytest.raises(ValueError, match="Cannot mix ban-list"):
+            parse_backend_filter("-flash2,natten", default)
 
-    @pytest.mark.xfail(raises=ValueError, strict=True)
     def test_error_invalid_allow_backends(self):
         """Test that invalid backends in allow-list raise an error."""
         default = ["flash2", "natten", "cudnn"]
         # This should raise ValueError about invalid backend in allow-list
-        parse_backend_filter("flash3", default)
+        with pytest.raises(ValueError, match=r"Invalid backend\(s\) in allow-list: \['flash3'\]"):
+            parse_backend_filter("flash3", default)
 
-    @pytest.mark.xfail(raises=ValueError, strict=True)
     def test_error_case_sensitivity_allow(self):
         """Test that backend names are case-sensitive in allow-list."""
         default = ["flash2", "natten"]
-        # This should raise ValueError about invalid backend (case mismatch)
-        parse_backend_filter("Flash2", default)
+        # Matching on the rejected name pins the case-sensitivity behavior: if the
+        # allow-list were ever lower-cased, "Flash2" would resolve to a valid backend
+        # and no error would be raised at all.
+        with pytest.raises(ValueError, match=r"Invalid backend\(s\) in allow-list: \['Flash2'\]"):
+            parse_backend_filter("Flash2", default)
 
 
 @pytest.mark.L0
@@ -218,7 +220,7 @@ class TestBackendListIntegration(unittest.TestCase):
 class TestBackendListOrdering(unittest.TestCase):
     """Pin the per-arch default backend ordering in get_backend_list.
 
-    Ordering encodes known relative performance, so a silent reorder is a
+    Ordering encodes rollout priority and known relative performance, so a silent reorder is a
     regression. These tests lock the exact list (with no env-var filtering) for
     each architecture branch, including the SM11x/12x block and its ordering
     difference vs SM100/103.
@@ -255,12 +257,12 @@ class TestBackendListOrdering(unittest.TestCase):
         assert get_backend_list(80) == ["flash2", "cudnn", "natten"]
         assert get_backend_list(89) == ["flash2", "cudnn", "natten"]
 
-        # H100 (SM90) -> flash3 leads.
-        assert get_backend_list(90) == ["flash3", "cudnn", "natten", "flash2"]
+        # H100/H200 (SM90) -> flash3 leads, followed by flash4.
+        assert get_backend_list(90) == ["flash3", "flash4", "cudnn", "natten", "flash2"]
 
-        # SM100/103 -> cudnn, natten, flash2 (flash2 trails natten).
+        # SM100/103 -> cudnn leads, then natten, flash4, flash2 (flash4 trails natten during rollout).
         for arch in (100, 103):
-            assert get_backend_list(arch) == ["cudnn", "natten", "flash2"], arch
+            assert get_backend_list(arch) == ["cudnn", "natten", "flash4", "flash2"], arch
 
         # SM110/120/121 -> cudnn, flash2, natten (flash2 ahead of natten).
         for arch in (110, 120, 121):

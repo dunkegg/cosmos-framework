@@ -8,6 +8,7 @@ import math
 import torch
 
 from cosmos_framework.data.generator.sequence_packing.mrope import get_3d_mrope_ids_vae_tokens
+from cosmos_framework.data.generator.sequence_packing.runtime import to_device_nonblocking
 from cosmos_framework.data.generator.sequence_packing.sequence import PackedSequenceBuilder
 
 
@@ -106,7 +107,7 @@ def pack_supertokens_temporal_causal(
                 real_actions = input_action_tokens.squeeze(0)  # [T*tcf,action_dim] or [N,action_dim]
             else:
                 real_actions = input_action_tokens  # [N,action_dim]
-            null_tokens = torch.zeros(tcf, action_dim, device=device, dtype=real_actions.dtype)  # [tcf,action_dim]
+            null_tokens = real_actions.new_zeros((tcf, action_dim))  # [tcf,action_dim]
             if real_actions.shape[0] == latent_t * tcf:
                 # AR generation (single frame: tcf == 1*tcf, or chunk: latent_t*tcf):
                 # every supertoken carries a real action, no null prefix.
@@ -142,15 +143,16 @@ def pack_supertokens_temporal_causal(
 
     # Vision conditioning mask: (T, 1, 1)
     condition_set_vision = {idx for idx in condition_frame_indexes_vision if 0 <= idx < latent_t}
-    vision_condition_mask = torch.zeros((latent_t, 1, 1), device=device, dtype=dtype)  # [T,1,1]
+    # Built on the host and moved asynchronously: writing Python scalars into a CUDA tensor
+    # element by element synchronises the host with the device on every call.
+    vision_condition_mask = torch.zeros((latent_t, 1, 1), dtype=dtype)  # [T,1,1]
     for fidx in condition_set_vision:
         vision_condition_mask[fidx, 0, 0] = 1.0
-    vision.condition_mask.append(vision_condition_mask)
+    vision.condition_mask.append(to_device_nonblocking(vision_condition_mask, device))
 
-    vision_noisy_frame_indexes = torch.tensor(
-        [idx for idx in range(latent_t) if idx not in condition_set_vision],
-        device=device,
-        dtype=torch.long,
+    vision_noisy_frame_indexes = to_device_nonblocking(
+        torch.tensor([idx for idx in range(latent_t) if idx not in condition_set_vision], dtype=torch.long),
+        device,
     )  # [N_noisy_frames]
     vision.noisy_frame_indexes.append(vision_noisy_frame_indexes)
 

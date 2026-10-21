@@ -6,11 +6,20 @@
 Multi-reference data layout (per sample):
     annotations: dict with keys {instruction, raw_instruction, in_instruction,
         input_images, output_image, editing_type, dataset_name, split}
-    images: dict mapping {input_01, input_02, ..., input_NN, output} -> raw JPEG bytes
+    images: dict mapping ``input_01, input_02, ..., input_NN`` -> reference image
+        blob(s) plus ``output`` -> the single target image blob.
+
+The ``input_NN`` reference entries may be either a single image blob (legacy
+format) or a **list of version blobs** (current format, where each reference has
+multiple augmentation variants such as different aspect ratio / background). When
+it is a list, one version is sampled uniformly at random per reference per sample.
+The ``output`` target is always a single blob.
 
 The ``instruction`` field may be either a single string (legacy format) or a
-dict of prompt variants ``{original, short, medium, detailed}`` (new format).
-For the dict form, one variant is sampled uniformly at random per sample.
+dict of prompt variants (e.g. ``{original, short, diverse}`` in the current
+format, or the legacy ``{original, short, medium, detailed}``). For the dict
+form, one variant is sampled uniformly at random per sample over whichever
+canonical keys are present.
 
 These augmentors transform that on-disk format into the same in-memory layout
 expected by ``ImageEditingToTrainingFormat`` (i.e. ``source_image`` is a list of
@@ -29,6 +38,7 @@ from PIL import Image, UnidentifiedImageError
 
 from cosmos_framework.data.imaginaire.webdataset.augmentors.augmentor import Augmentor
 from cosmos_framework.utils import log
+from cosmos_framework.data.generator.augmentors.multi_reference_bbox_condition import parse_reference_bboxes
 
 Image.MAX_IMAGE_PIXELS = 933120000
 
@@ -36,10 +46,13 @@ _INPUT_KEY_RE = re.compile(r"^input_(\d+)$")
 _OUTPUT_KEY = "output"
 
 # The ``instruction`` annotation field may be either a single string (legacy
-# format) or a dict of prompt variants at different lengths (new format). When
-# it is a dict, one variant is sampled uniformly at random per sample. These are
-# the variant keys we sample over, in their canonical order.
-_PROMPT_VARIANT_KEYS = ("original", "short", "medium", "detailed")
+# format) or a dict of prompt variants at different lengths. When it is a dict,
+# one variant is sampled uniformly at random per sample over whichever of these
+# canonical keys are present. This is the union of the current format's keys
+# ``{original, short, diverse}`` and the legacy format's keys
+# ``{original, short, medium, detailed}``, so both on-disk formats are supported
+# without any config change: absent keys are simply skipped when sampling.
+_PROMPT_VARIANT_KEYS = ("original", "short", "diverse", "medium", "detailed")
 
 
 def _sorted_input_keys(keys: list[str]) -> list[str]:
@@ -56,10 +69,17 @@ def _sorted_input_keys(keys: list[str]) -> list[str]:
 class MultiReferencePKLToMedia(Augmentor):
     """Decode the multi-reference image bundle into PIL images.
 
-    Reads ``data_dict[input_key]`` (a ``dict[str, bytes]`` whose keys are
-    ``input_01``..``input_NN`` plus ``output``) and writes the decoded PIL
-    images into ``data_dict[output_key]`` as ``dict[str, PIL.Image]`` with the
-    same keys.
+    Reads ``data_dict[input_key]`` (a dict whose keys are ``input_01``..
+    ``input_NN`` plus ``output``) and writes the decoded PIL images into
+    ``data_dict[output_key]`` as ``dict[str, PIL.Image]`` with the same keys.
+
+    Each ``input_NN`` value may be either:
+        - a single image blob (``bytes``) — legacy format, or
+        - a list/tuple of version blobs (current format) where each entry is a
+          different augmentation variant of the same reference (e.g. different
+          aspect ratio / background). One version is sampled uniformly at random
+          per reference per sample, so only the chosen blob is decoded.
+    The ``output`` target is always a single blob.
 
     Returns ``None`` (skip sample) if any image fails to decode or if the
     ``output`` image is missing — both are required for training.
@@ -75,6 +95,32 @@ class MultiReferencePKLToMedia(Augmentor):
         super().__init__(input_keys or [], args=args)
         self.input_key = input_key
         self.output_key = output_key
+
+    def _select_blob(self, item: object, name: str) -> bytes | None:
+        """Resolve a single image blob to decode for one bundle entry.
+
+        Handles both on-disk formats: a single ``bytes`` blob (legacy, and always
+        the case for ``output``) is returned as-is, while a list/tuple of version
+        blobs (current format, one per augmentation variant) has one entry sampled
+        uniformly at random. Returns ``None`` (skip sample) on an unexpected type
+        or an empty / all-invalid version list.
+        """
+        if isinstance(item, (bytes, bytearray)):
+            return bytes(item)
+        if isinstance(item, (list, tuple)):
+            versions = [v for v in item if isinstance(v, (bytes, bytearray))]
+            if not versions:
+                log.warning(
+                    f"Skipping item '{name}': no valid image blobs in version list (len={len(item)})",
+                    rank0_only=False,
+                )
+                return None
+            return bytes(random.choice(versions))
+        log.warning(
+            f"Skipping item '{name}': expected bytes or list of bytes, got {type(item)}",
+            rank0_only=False,
+        )
+        return None
 
     def _bytes_to_pil(self, image_bytes: bytes, identifier: str) -> Image.Image | None:
         try:
@@ -112,13 +158,10 @@ class MultiReferencePKLToMedia(Augmentor):
 
         media: dict[str, Image.Image] = {}
         for name, item in bundle.items():
-            if not isinstance(item, (bytes, bytearray)):
-                log.warning(
-                    f"Skipping item '{name}': expected bytes, got {type(item)}",
-                    rank0_only=False,
-                )
+            blob = self._select_blob(item, name)
+            if blob is None:
                 return None
-            decoded = self._bytes_to_pil(bytes(item), identifier=f"{self.input_key}['{name}']")
+            decoded = self._bytes_to_pil(blob, identifier=f"{self.input_key}['{name}']")
             if decoded is None:
                 return None
             media[name] = decoded
@@ -157,9 +200,10 @@ class ExtractMultiReferenceConversation(Augmentor):
 
     The ``instruction`` field supports two formats:
         - str: a single instruction (legacy format), used directly.
-        - dict: prompt variants keyed by ``original``/``short``/``medium``/
-          ``detailed`` (new format); one non-empty variant is sampled uniformly
-          at random per sample.
+        - dict: prompt variants (e.g. ``original``/``short``/``diverse`` in the
+          current format, or the legacy ``original``/``short``/``medium``/
+          ``detailed``); one non-empty variant is sampled uniformly at random
+          per sample over whichever canonical keys are present.
 
     Output additions to ``data_dict``:
         source_image: list[PIL.Image] in input-index order, truncated to
@@ -171,6 +215,10 @@ class ExtractMultiReferenceConversation(Augmentor):
             (used for logging only).
 
     Returns ``None`` when required fields are missing.
+
+    When ``read_reference_bboxes`` is enabled, also preserve logical input keys
+    and validated target-normalized boxes. Scene and abstract-control references
+    without boxes, including samples with an empty bbox list, remain valid.
     """
 
     def __init__(
@@ -182,6 +230,7 @@ class ExtractMultiReferenceConversation(Augmentor):
         instruction_key: str = "instruction",
         prompt_variant_keys: tuple[str, ...] | list[str] = _PROMPT_VARIANT_KEYS,
         args: Optional[dict] = None,
+        read_reference_bboxes: bool = False,
     ) -> None:
         super().__init__(input_keys or [], args=args)
         if max_reference_images <= 0:
@@ -191,6 +240,7 @@ class ExtractMultiReferenceConversation(Augmentor):
         self.media_key = media_key
         self.instruction_key = instruction_key
         self.prompt_variant_keys = tuple(prompt_variant_keys)
+        self.read_reference_bboxes: bool = read_reference_bboxes
 
     def _resolve_instruction(self, annotation: dict) -> str | None:
         """Resolve the instruction string, sampling a variant when given a dict.
@@ -271,7 +321,25 @@ class ExtractMultiReferenceConversation(Augmentor):
             return None
 
         if len(ordered_input_keys) > self.max_reference_images:
+            if self.read_reference_bboxes:
+                log.warning(
+                    f"Skipping bbox sample {data_dict.get('__key__', 'unknown')!r}: "
+                    f"{len(ordered_input_keys)} references exceed the limit {self.max_reference_images}; "
+                    "truncating would invalidate prompt and bbox references.",
+                    rank0_only=False,
+                )
+                return None
             ordered_input_keys = ordered_input_keys[: self.max_reference_images]
+
+        if self.read_reference_bboxes:
+            try:
+                data_dict["reference_bboxes"] = parse_reference_bboxes(
+                    annotation.get("reference_bboxes"), ordered_input_keys
+                )
+            except ValueError as error:
+                log.warning(f"Skipping bbox sample {data_dict.get('__key__', 'unknown')!r}: {error}", rank0_only=False)
+                return None
+            data_dict["source_reference_keys"] = ordered_input_keys
 
         source_images: list[Image.Image] = []
         for key in ordered_input_keys:
@@ -384,6 +452,9 @@ class ReorderReferenceImages(Augmentor):
     The marker rewrite is done in a single ``re.sub`` pass to avoid cascading rewrites
     (e.g. ``<img-1>`` -> ``<img-2>`` -> ``<img-3>``). Markers whose index falls outside
     ``[1, len(source_image)]`` are left untouched.
+
+    If bbox conditioning carries ``source_reference_keys``, the same permutation
+    is applied to those keys. Boxes remain keyed by the logical input group.
     """
 
     def __init__(
@@ -442,6 +513,11 @@ class ReorderReferenceImages(Augmentor):
             return match.group(0)
 
         data_dict[self.source_key] = [source_image[perm[i]] for i in range(n)]
+        # Bbox maps stay keyed by logical input group. Reorder the group keys so
+        # condition rendering/formatting uses the same new numbering as the prompt.
+        if "source_reference_keys" in data_dict:
+            reference_keys = data_dict["source_reference_keys"]
+            data_dict["source_reference_keys"] = [reference_keys[index] for index in perm]
         data_dict[self.instruction_key] = _MARKER_RE.sub(_remap, instruction)
 
         return data_dict

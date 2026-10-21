@@ -5,16 +5,21 @@ import functools
 import inspect
 import os
 import signal
-from dataclasses import dataclass
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 import torch.distributed as dist
 import torch.utils.data
 
-from cosmos_framework.utils.flags import INTERNAL
 from cosmos_framework.utils.context_managers import distributed_init
-from cosmos_framework.utils.profiling import maybe_enable_memory_snapshot, maybe_enable_nsys_profiling, maybe_enable_profiling
+from cosmos_framework.utils.flags import INTERNAL
+from cosmos_framework.utils.profiling import (
+    maybe_enable_memory_snapshot,
+    maybe_enable_nsys_profiling,
+    maybe_enable_profiling,
+)
 
 try:
     from megatron.core import parallel_state
@@ -24,12 +29,11 @@ except ImportError:
     USE_MEGATRON = False
 
 
-from cosmos_framework.utils.lazy_config import LazyConfig, instantiate
 from cosmos_framework.model._base import ImaginaireModel
 from cosmos_framework.utils import callback, distributed, ema, log, misc
 from cosmos_framework.utils.checkpointer import Checkpointer
+from cosmos_framework.utils.lazy_config import LazyConfig, instantiate
 from cosmos_framework.utils.misc import StragglerDetectorV2
-
 
 
 @dataclass
@@ -37,10 +41,13 @@ class ContextParallelDataWindow:
     """Caches one dataloader batch across a ``cp_size``-step CP data window.
 
     Each slot is one training step within the window; CP rank ``s`` owns slot ``s``.
-    The cached batch is cleared after the final slot.
+    The cached batch is cleared after the final slot. When raw-batch release is
+    enabled, ``batch`` remains on the host and ``prepared_batch`` holds the much
+    smaller device batch left after model preprocessing.
     """
 
     batch: dict[str, Any] | None = None
+    prepared_batch: dict[str, Any] | None = None
     offset: int = 0
 
     @property
@@ -49,6 +56,7 @@ class ContextParallelDataWindow:
 
     def clear(self) -> None:
         self.batch = None
+        self.prepared_batch = None
         self.offset = 0
 
     def advance(self, cp_size: int) -> None:
@@ -60,6 +68,64 @@ class ContextParallelDataWindow:
         """Replace the cached batch with a device copy while the window is active."""
         if self.active:
             self.batch = data_batch
+
+    def store_prepared_batch(self, data_batch: dict[str, Any]) -> None:
+        """Cache the device batch after its raw video tensors are released."""
+        if self.active:
+            self.prepared_batch = data_batch
+
+    @staticmethod
+    def build_callback_batch(
+        host_batch: dict[str, Any] | None,
+        prepared_batch: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Restore host raw inputs alongside metadata produced during preprocessing.
+
+        When video was released from the prepared batch during tokenization, the
+        host batch's video is restored.  If the prepared batch carries
+        ``num_vision_items_per_sample`` (indicating a flattened multi-item
+        layout), the restored host video is flattened to match: each nested
+        sub-list is expanded and every item gains a leading batch dimension.
+        For uint8 multiview video these are tensor views — no pixel copy.
+
+        ``is_preprocessed`` is set to ``False`` only when the restored video is
+        unnormalized uint8.  Already-normalized float32 host video and retained
+        CUDA images keep the flag so downstream consumers skip re-normalization.
+        """
+        if host_batch is None:
+            return prepared_batch
+        callback_batch = dict(host_batch)
+        callback_batch.update(prepared_batch)
+
+        # Detect video keys restored from the host: present in host but absent
+        # from the prepared batch (the model popped them during tokenization).
+        _VIDEO_KEYS = ("video", "images")
+        for key in _VIDEO_KEYS:
+            if key not in host_batch or key in prepared_batch:
+                continue
+            # Video was restored from host.  Flatten nested multi-item lists to
+            # match the ``num_vision_items_per_sample`` layout the prepared batch
+            # carries, and add the batch dimension that preprocessing added.
+            items = callback_batch[key]
+            if isinstance(items, list) and items and isinstance(items[0], (list, tuple)):
+                callback_batch[key] = [
+                    item.unsqueeze(0) if isinstance(item, torch.Tensor) and item.dim() == 4 else item
+                    for sublist in items
+                    for item in sublist
+                ]
+                items = callback_batch[key]
+
+            # Set ``is_preprocessed`` to False only when the restored media is
+            # unnormalized uint8 and therefore needs re-normalization.
+            if (
+                isinstance(items, list)
+                and items
+                and isinstance(items[0], torch.Tensor)
+                and items[0].dtype == torch.uint8
+            ):
+                callback_batch["is_preprocessed"] = False
+
+        return callback_batch
 
     def assert_synced_with_model(self, model: Any) -> None:
         """Raise if the model's CP window slot has drifted from this window's offset.
@@ -73,6 +139,88 @@ class ContextParallelDataWindow:
             raise RuntimeError(
                 f"CP data-window desync: trainer offset {self.offset} != model window slot {model_window_slot}."
             )
+
+
+@dataclass
+class StepBatch:
+    """Encapsulates batch routing for one training step.
+
+    Returned by :meth:`ImaginaireTrainer._next_step_batch` so the ``train()``
+    loop never needs conditional logic for CP window slots or raw-batch release.
+    """
+
+    training: dict[str, Any]
+    """Batch on CUDA, passed to ``training_step``."""
+
+    _host_raw: dict[str, Any] | None
+    """Host batch with raw uint8 pixels.  ``None`` outside release mode."""
+
+    _window: ContextParallelDataWindow | None
+    """Reference to the CP data window; used by :meth:`finalize`."""
+
+    _is_fetch_slot: bool
+    """``True`` for the first slot of a CP window (where fresh data is fetched
+    and tokenized), or for every step in non-CP training."""
+
+    _cached_pre: dict[str, Any] | None = field(default=None, init=False, repr=False)
+    """Cached pre-step callback batch.  Computed on first access so that
+    paired hooks (``on_training_step_start`` / ``on_training_step_batch_start``)
+    share the same dictionary and observe each other's edits."""
+
+    _cached_post: dict[str, Any] | None = field(default=None, init=False, repr=False)
+    """Cached post-step callback batch.  Computed on first access after
+    :meth:`finalize` so that paired hooks
+    (``on_training_step_batch_end`` / ``on_training_step_end``) share the same
+    dictionary and observe each other's edits."""
+
+    @property
+    def callback_pre_step(self) -> dict[str, Any]:
+        """Batch for ``on_training_step_start`` / ``on_training_step_batch_start``.
+
+        At the fetch slot with release, the CUDA batch still has raw tensors
+        (the model hasn't run yet), so no merge is needed.  At later slots the
+        raw pixels only exist on the host and must be merged with the device
+        metadata.  The result is cached so both hooks see the same object.
+        """
+        if self._cached_pre is None:
+            if self._host_raw is None or self._is_fetch_slot:
+                self._cached_pre = self.training
+            else:
+                self._cached_pre = ContextParallelDataWindow.build_callback_batch(self._host_raw, self.training)
+        return self._cached_pre
+
+    @property
+    def callback_post_step(self) -> dict[str, Any]:
+        """Batch for ``on_training_step_batch_end`` / ``on_training_step_end``.
+
+        After the training step the model may have trimmed raw tensors from the
+        CUDA batch in-place, so both fetch and later slots need the host merge.
+        The result is cached so both hooks see the same object.
+        """
+        if self._cached_post is None:
+            if self._host_raw is None:
+                self._cached_post = self.training
+            else:
+                self._cached_post = ContextParallelDataWindow.build_callback_batch(self._host_raw, self.training)
+        return self._cached_post
+
+    def finalize(self) -> None:
+        """Post-training-step bookkeeping.
+
+        At the fetch slot in release mode the model has trimmed the raw device
+        tensors in-place; store what remains so later slots can reuse it.
+        """
+        if self._window is not None and self._is_fetch_slot and self._host_raw is not None:
+            self._window.store_prepared_batch(self.training)
+
+
+def persistent_validation_enabled(config_trainer: Any) -> bool:
+    """Whether training keeps one validation iterator alive, so validation data advances across calls."""
+    return bool(
+        config_trainer.run_validation
+        and getattr(config_trainer, "prefetch_validation", False)
+        and config_trainer.max_val_iter is not None
+    )
 
 
 class ImaginaireTrainer:
@@ -95,6 +243,28 @@ class ImaginaireTrainer:
         """
         super().__init__()
         self.config = config
+        steps_per_epoch = getattr(config.trainer, "steps_per_epoch", None)
+        num_epochs = getattr(config.trainer, "num_epochs", None)
+        self.steps_per_epoch = int(steps_per_epoch) if steps_per_epoch else None
+        self.num_epochs = int(num_epochs) if num_epochs else None
+        if (self.steps_per_epoch is None) != (self.num_epochs is None):
+            raise ValueError("trainer.steps_per_epoch and trainer.num_epochs must be configured together")
+        self.max_iterations = (
+            self.steps_per_epoch * self.num_epochs
+            if self.steps_per_epoch is not None and self.num_epochs is not None
+            else int(config.trainer.max_iter)
+        )
+        cycle_lengths = getattr(config.scheduler, "cycle_lengths", None)
+        if self.num_epochs is not None and cycle_lengths and sum(cycle_lengths) < self.max_iterations:
+            raise ValueError(
+                "scheduler.cycle_lengths must cover trainer.num_epochs * trainer.steps_per_epoch; "
+                "update the learning-rate schedule when changing the epoch horizon"
+            )
+        if int(getattr(config.checkpoint, "save_freq_in_epoch", 0)) > 0 and self.steps_per_epoch is None:
+            raise ValueError("checkpoint.save_freq_in_epoch requires trainer.num_epochs and trainer.steps_per_epoch")
+        if int(getattr(config.trainer, "validation_freq_in_epoch", 0)) > 0 and self.steps_per_epoch is None:
+            raise ValueError("trainer.validation_freq_in_epoch requires trainer.num_epochs and trainer.steps_per_epoch")
+        self._validation_iterator: Iterator[Any] | None = None
         # Set up the distributed computing environment.
         with distributed_init():
             distributed.init()
@@ -142,8 +312,8 @@ class ImaginaireTrainer:
             LazyConfig.save_yaml(config, f"{config.job.path_local}/config.yaml")
         dist.barrier()
         if INTERNAL:
-            log.init_loguru_file(f"{config.job.path_local}/stdout.log")
             if distributed.is_rank0():
+                log.init_loguru_file(f"{config.job.path_local}/stdout.log")
                 # Print important environment variables and the effective config.
                 log.info("Config:\n" + config.pretty_print(use_color=True))
             misc.print_environ_variables(["TORCH_HOME", "IMAGINAIRE_OUTPUT_ROOT", "ENABLE_ONELOGGER"])
@@ -242,6 +412,98 @@ class ImaginaireTrainer:
         self._cp_data_window.advance(cp_size)
         return data_batch, False
 
+    def _next_step_batch(
+        self,
+        model: ImaginaireModel,
+        dataloader_iter: Any,
+    ) -> tuple[StepBatch | None, bool]:
+        """Fetch, prepare, and route the next training batch.
+
+        Delegates to :meth:`_fetch_data_batch` for the actual fetch (which
+        subclasses may override), then wraps the result in a :class:`StepBatch`
+        that encapsulates CUDA transfer, host-batch retention, and callback
+        batch construction.  The ``train()`` loop is routing-agnostic.
+
+        Returns:
+            tuple: (step_batch, stop_signal)
+                - step_batch: A :class:`StepBatch` ready for the training step,
+                  or ``None`` if stopped.
+                - stop_signal (bool): ``True`` if the dataloader is exhausted.
+        """
+        parallel_dims = getattr(model, "parallel_dims", None)
+        cp_enabled = parallel_dims is not None and parallel_dims.cp_enabled
+        release = self._release_cp_raw_batch_after_preprocessing(model) if cp_enabled else False
+
+        # Fast path: no release mode — fetch, move to CUDA, cache for later CP slots.
+        if not release:
+            data_batch, stop = self._fetch_data_batch(model, dataloader_iter)
+            if stop:
+                return None, True
+            training = misc.to(data_batch, device="cuda")
+            self._cp_data_window.store_device_batch(training)
+            return StepBatch(training=training, _host_raw=None, _window=None, _is_fetch_slot=True), False
+
+        # Release mode: capture window references *before* _fetch_data_batch,
+        # whose internal advance() may clear the window at the last slot.
+        is_fetch_slot = not self._cp_data_window.active
+        if self._cp_data_window.active:
+            host_raw: dict[str, Any] | None = self._cp_data_window.batch
+            prepared: dict[str, Any] | None = (
+                self._cp_data_window.prepared_batch if self._cp_data_window.offset > 0 else None
+            )
+        else:
+            host_raw = None
+            prepared = None
+
+        data_batch, stop = self._fetch_data_batch(model, dataloader_iter)
+        if stop:
+            return None, True
+
+        # For the fetch slot the returned batch itself is the host batch.
+        if is_fetch_slot:
+            host_raw = data_batch
+            training = misc.to(data_batch, device="cuda")
+        else:
+            # Non-owner slots use the pre-captured prepared batch
+            # (the trimmed device batch stored by finalize() at slot 0).
+            if prepared is None:
+                raise RuntimeError("CP prepared batch is empty before its data window is complete.")
+            training = prepared
+
+        return StepBatch(
+            training=training,
+            _host_raw=host_raw,
+            _window=self._cp_data_window,
+            _is_fetch_slot=is_fetch_slot,
+        ), False
+
+    @staticmethod
+    def _release_cp_raw_batch_after_preprocessing(model: ImaginaireModel) -> bool:
+        """Return whether this CP model keeps raw inputs on the host between slots."""
+        parallel_dims = getattr(model, "parallel_dims", None)
+        if parallel_dims is None or not parallel_dims.cp_enabled:
+            return False
+        model_config = getattr(model, "config", None)
+        return bool(getattr(model_config, "release_cp_raw_batch_after_preprocessing", False))
+
+    @staticmethod
+    def _context_parallel_size(model: ImaginaireModel) -> int:
+        parallel_dims = getattr(model, "parallel_dims", None)
+        if parallel_dims is None or not parallel_dims.cp_enabled:
+            return 1
+        return int(parallel_dims.cp_mesh.size())
+
+    def _resume_dataloader_fetch_count(self, model: ImaginaireModel, iteration: int) -> int:
+        """Return the raw-batch position used to restart the dataloader.
+
+        Partial CP windows are intentionally discarded on resume because their
+        rank-local batches and tokenized payloads are not checkpointed. Starting at
+        the next raw batch avoids replaying any data from that partial window.
+        """
+        microsteps = iteration * self.config.trainer.grad_accum_iter
+        cp_size = self._context_parallel_size(model)
+        return (microsteps + cp_size - 1) // cp_size
+
     def train(
         self,
         model: ImaginaireModel,
@@ -277,8 +539,9 @@ class ImaginaireTrainer:
         self.callbacks.on_optimizer_init_end()
         # Load the model checkpoint and get the starting iteration number.
         iteration = self.checkpointer.load(model, optimizer, scheduler, grad_scaler)
+        dataloader_fetch_count = self._resume_dataloader_fetch_count(model, iteration)
         if hasattr(dataloader_train, "set_start_iteration"):
-            dataloader_train.set_start_iteration(iteration * self.config.trainer.grad_accum_iter)
+            dataloader_train.set_start_iteration(dataloader_fetch_count)
         grad_accum_iter = 0
         log.critical(f"Distributed parallelism mode: {self.config.trainer.distributed_parallelism}")
         if self.config.trainer.distributed_parallelism == "ddp":
@@ -307,14 +570,22 @@ class ImaginaireTrainer:
             # callbacks) so data-augmentation randomness starts from a deterministic state
             # regardless of how much RNG state init consumed.
             misc.set_random_seed(seed=self.config.trainer.seed, by_rank=True)
+        if persistent_validation_enabled(self.config.trainer) and self._validation_iterator is None:
+            self._validation_iterator = iter(dataloader_val)
         with (
             maybe_enable_profiling(self.config, global_step=iteration) as torch_profiler,
             maybe_enable_memory_snapshot(self.config, global_step=iteration) as memory_profiler,
             maybe_enable_nsys_profiling(self.config, global_step=iteration) as nsys_profiler,
         ):
             while True:
+                if iteration >= self.max_iterations:
+                    break
                 dataloader_train_iter = iter(dataloader_train)
                 while True:
+                    # Stop at the effective epoch/iteration horizon before fetching another batch.
+                    if iteration >= self.max_iterations:
+                        _end_training = True
+                        break
                     self.callbacks.on_before_dataloading(iteration)
                     try:
                         with (
@@ -325,7 +596,7 @@ class ImaginaireTrainer:
                                 profile_cuda=False,
                             ),
                         ):
-                            data_batch, stop_signal = self._fetch_data_batch(
+                            step_batch, stop_signal = self._next_step_batch(
                                 model,
                                 dataloader_train_iter,
                             )
@@ -335,17 +606,11 @@ class ImaginaireTrainer:
                         break
                     finally:
                         self.callbacks.on_after_dataloading(iteration)
-                    # If max_iter is reached, exit the training loop.
-                    if iteration >= self.config.trainer.max_iter:
-                        _end_training = True
-                        break
-                    # Move all tensors in the data batch to GPU device.
-                    data_batch = misc.to(data_batch, device="cuda")
-                    # Keep the CUDA copy for later slots in the CP data window.
-                    self._cp_data_window.store_device_batch(data_batch)
                     # The actual training step.
-                    self.callbacks.on_training_step_start(model, data_batch, iteration=iteration)
-                    self.callbacks.on_training_step_batch_start(model, data_batch, iteration=iteration)
+                    self.callbacks.on_training_step_start(model, step_batch.callback_pre_step, iteration=iteration)
+                    self.callbacks.on_training_step_batch_start(
+                        model, step_batch.callback_pre_step, iteration=iteration
+                    )
                     if not model.training:
                         model_ddp.train()
                     assert model_ddp.training, "model_ddp is not in training mode."
@@ -355,24 +620,64 @@ class ImaginaireTrainer:
                         optimizer,
                         scheduler,
                         grad_scaler,
-                        data_batch,
+                        step_batch.training,
                         iteration=iteration,
                         grad_accum_iter=grad_accum_iter,
                     )
+                    step_batch.finalize()
                     self.callbacks.on_training_step_batch_end(
-                        model, data_batch, output_batch, loss, iteration=iteration
+                        model, step_batch.callback_post_step, output_batch, loss, iteration=iteration
                     )
                     # If the gradients are still being accumulated, continue to load the next training batch.
                     if grad_accum_iter != 0:
+                        # Release this microstep's outputs before the next forward/backward.
+                        del output_batch, loss
                         continue
                     # Do the following when an actual optimizer (update) step has been made.
                     iteration += 1
                     # Save checkpoint.
-                    if iteration % self.config.checkpoint.save_iter == 0:
-                        self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=iteration)
-                    self.callbacks.on_training_step_end(model, data_batch, output_batch, loss, iteration=iteration)
+                    completed_epoch = (
+                        iteration // self.steps_per_epoch
+                        if self.steps_per_epoch and iteration % self.steps_per_epoch == 0
+                        else None
+                    )
+                    save_freq_in_epoch = int(getattr(self.config.checkpoint, "save_freq_in_epoch", 0))
+                    epoch_save_due = bool(
+                        completed_epoch is not None
+                        and save_freq_in_epoch > 0
+                        and completed_epoch % save_freq_in_epoch == 0
+                    )
+                    iter_save_due = save_freq_in_epoch == 0 and iteration % self.config.checkpoint.save_iter == 0
+                    if epoch_save_due or iter_save_due:
+                        self.checkpointer.save(
+                            model,
+                            optimizer,
+                            scheduler,
+                            grad_scaler,
+                            iteration=iteration,
+                            epoch=completed_epoch if epoch_save_due else None,
+                        )
+                    self.callbacks.on_training_step_end(
+                        model,
+                        step_batch.callback_post_step,
+                        output_batch,
+                        loss,
+                        iteration=iteration,
+                    )
+                    # Callback consumers have finished; do not retain GPU outputs through
+                    # validation or the next training step. Callback-owned references remain valid.
+                    del output_batch, loss
                     # Validation.
-                    if self.config.trainer.run_validation and iteration % self.config.trainer.validation_iter == 0:
+                    validation_freq_in_epoch = int(getattr(self.config.trainer, "validation_freq_in_epoch", 0))
+                    epoch_validation_due = bool(
+                        completed_epoch is not None
+                        and validation_freq_in_epoch > 0
+                        and completed_epoch % validation_freq_in_epoch == 0
+                    )
+                    iter_validation_due = (
+                        validation_freq_in_epoch == 0 and iteration % self.config.trainer.validation_iter == 0
+                    )
+                    if self.config.trainer.run_validation and (epoch_validation_due or iter_validation_due):
                         self.validate(model, dataloader_val, iteration=iteration)
                     # This iteration is successful; reset the timeout signal.
                     signal.alarm(self.config.trainer.timeout_period)
@@ -385,11 +690,28 @@ class ImaginaireTrainer:
                         nsys_profiler.step()
                 if _end_training:
                     break
+        self._validation_iterator = None
         log.success("Done with training.")
         if sm_carveout:
             torch._C._set_sm_carveout_experimental(None)
-        if iteration % self.config.checkpoint.save_iter != 0:
-            self.checkpointer.save(model, optimizer, scheduler, grad_scaler, iteration=iteration)
+        final_epoch = (
+            iteration // self.steps_per_epoch
+            if self.steps_per_epoch and iteration % self.steps_per_epoch == 0
+            else None
+        )
+        save_freq_in_epoch = int(getattr(self.config.checkpoint, "save_freq_in_epoch", 0))
+        final_already_saved = (
+            final_epoch is not None and save_freq_in_epoch > 0 and final_epoch % save_freq_in_epoch == 0
+        ) or (save_freq_in_epoch == 0 and iteration % self.config.checkpoint.save_iter == 0)
+        if not final_already_saved:
+            self.checkpointer.save(
+                model,
+                optimizer,
+                scheduler,
+                grad_scaler,
+                iteration=iteration,
+                epoch=final_epoch if save_freq_in_epoch > 0 else None,
+            )
         self.callbacks.on_train_end(model, iteration=iteration)
         self.checkpointer.finalize()
         distributed.barrier()
@@ -438,7 +760,8 @@ class ImaginaireTrainer:
                 with self.straggler_detector.profile_section(
                     "bwd", self.config.trainer.straggler_detection.analyze_backward
                 ):
-                    loss_scaled = grad_scaler.scale(loss / self.config.trainer.grad_accum_iter)
+                    backward_loss = output_batch.get("_backward_loss", loss)
+                    loss_scaled = grad_scaler.scale(backward_loss / self.config.trainer.grad_accum_iter)
                     loss_scaled.backward()
                     model.on_after_backward()
             self.callbacks.on_after_backward(model, iteration=iteration)
@@ -448,10 +771,19 @@ class ImaginaireTrainer:
                 with self.straggler_detector.profile_section(
                     "opt", self.config.trainer.straggler_detection.analyze_optimizer
                 ):
-                    self.callbacks.on_before_optimizer_step(
-                        model, optimizer, scheduler, grad_scaler, iteration=iteration
-                    )
-                    model.on_before_optimizer_step(optimizer, scheduler, iteration=iteration)
+                    # Window-normalized objectives must scale accumulated gradients before
+                    # clipping/norm-monitor callbacks inspect them. Other models retain the
+                    # historical callback-before-model hook order.
+                    if "_backward_loss" in output_batch:
+                        model.on_before_optimizer_step(optimizer, scheduler, iteration=iteration)
+                        self.callbacks.on_before_optimizer_step(
+                            model, optimizer, scheduler, grad_scaler, iteration=iteration
+                        )
+                    else:
+                        self.callbacks.on_before_optimizer_step(
+                            model, optimizer, scheduler, grad_scaler, iteration=iteration
+                        )
+                        model.on_before_optimizer_step(optimizer, scheduler, iteration=iteration)
                     self._optimizer_step(model, optimizer, scheduler, grad_scaler, iteration=iteration)
                     self.callbacks.on_before_zero_grad(model, optimizer, scheduler, iteration=iteration)
                     model.on_before_zero_grad(optimizer, scheduler, iteration=iteration)
@@ -478,7 +810,7 @@ class ImaginaireTrainer:
 
     @torch.no_grad()
     def validate(self, model: ImaginaireModel, dataloader_val: torch.utils.data.DataLoader, iteration: int = 0) -> None:
-        """Validate on the full validation dataset.
+        """Validate on at most the configured number of validation batches.
 
         Args:
             model (ImaginaireModel): The PyTorch model.
@@ -487,13 +819,32 @@ class ImaginaireTrainer:
         """
         self.callbacks.on_validation_start(model, dataloader_val, iteration=iteration)
         model.eval()
-        # Evaluate on the full validation set.
+        max_val_iter = self.config.trainer.max_val_iter
+        reuse_iterator = getattr(self.config.trainer, "prefetch_validation", False) and max_val_iter is not None
+        validation_iterator = self._validation_iterator if reuse_iterator else None
+        if validation_iterator is None:
+            validation_iterator = iter(dataloader_val)
+            if reuse_iterator:
+                self._validation_iterator = validation_iterator
+
+        val_iter = 0
+        restarted_iterator = False
         with ema.ema_scope(model, enabled=model.config.ema.enabled):
-            for val_iter, data_batch in enumerate(dataloader_val):
-                if self.config.trainer.max_val_iter is not None and val_iter >= self.config.trainer.max_val_iter:
+            while max_val_iter is None or val_iter < max_val_iter:
+                try:
+                    data_batch = next(validation_iterator)
+                except StopIteration:
+                    if reuse_iterator:
+                        self._validation_iterator = None
+                        if val_iter == 0 and not restarted_iterator:
+                            validation_iterator = iter(dataloader_val)
+                            self._validation_iterator = validation_iterator
+                            restarted_iterator = True
+                            continue
                     break
                 data_batch = misc.to(data_batch, device="cuda")
                 self.callbacks.on_validation_step_start(model, data_batch, iteration=iteration)
                 output_batch, loss = model.validation_step(data_batch, iteration)
                 self.callbacks.on_validation_step_end(model, data_batch, output_batch, loss, iteration=iteration)
+                val_iter += 1
         self.callbacks.on_validation_end(model, iteration=iteration)

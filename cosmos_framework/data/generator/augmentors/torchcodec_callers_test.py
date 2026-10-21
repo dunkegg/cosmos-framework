@@ -150,24 +150,31 @@ def test_bytes_to_media_probe_duration_respects_start_end_frame(
 
 
 def test_multiview_extract_frames_resizes_torchcodec_frames(monkeypatch: pytest.MonkeyPatch) -> None:
-    module = _import_or_skip("cosmos_framework.data.generator.multiview.multiview_dataset")
+    module = _import_or_skip("cosmos_framework.data.generator.multiview.transforms")
     calls: list[tuple[object, list[int]]] = []
 
-    def fake_decode_frames_tchw_uint8(
-        source: object,
-        indices: list[int],
-        **_: object,
-    ) -> tuple[torch.Tensor, SimpleNamespace]:
-        calls.append((source, indices))
-        frames = torch.arange(len(indices) * 3 * 4 * 6, dtype=torch.uint8).reshape(len(indices), 3, 4, 6)  # [T,C,H,W]
-        return frames, SimpleNamespace(average_fps=29.97)
+    class FakeTorchCodecVideoReader:
+        metadata = SimpleNamespace(num_frames=100, average_fps=29.97)
 
-    monkeypatch.setattr(module, "decode_frames_tchw_uint8", fake_decode_frames_tchw_uint8)
+        def __init__(self, source: object) -> None:
+            self.source = source
+
+        def get_frames_tchw_uint8(self, indices: list[int]) -> torch.Tensor:
+            calls.append((self.source, indices))
+            return torch.arange(len(indices) * 3 * 4 * 6, dtype=torch.uint8).reshape(  # [T,C,H,W]
+                len(indices),
+                3,
+                4,
+                6,
+            )
+
+    monkeypatch.setattr(module, "TorchCodecVideoReader", FakeTorchCodecVideoReader)
 
     frames, fps, original_hw = module.ExtractFramesAndCaptions._extract_frames(  # [T,C,H,W]
         b"video",
         [1, 3, 5],
         (8, 12),
+        align_to_tokenizer=False,
     )
 
     assert calls == [(b"video", [1, 3, 5])]
@@ -178,39 +185,8 @@ def test_multiview_extract_frames_resizes_torchcodec_frames(monkeypatch: pytest.
 
 
 def test_multiview_augmentations_defer_normalization_to_model() -> None:
-    module = _import_or_skip("cosmos_framework.data.generator.multiview.multiview_dataset")
+    module = _import_or_skip("cosmos_framework.data.generator.multiview.local_pipeline")
 
-    augmentations, _ = module.make_augmentations(module.MultiviewAugmentationConfig())
+    augmentations = module.make_auto_augmentations({})
 
-    assert "normalize" not in augmentations
-
-
-def test_sekai_frame_count_uses_probe_video(monkeypatch: pytest.MonkeyPatch) -> None:
-    module = _import_or_skip("projects.cosmos3.sil.omnidreams.datasets.sekai")
-    seen: list[bytes] = []
-
-    def fake_probe_video(source: bytes) -> SimpleNamespace:
-        seen.append(source)
-        return SimpleNamespace(num_frames=37, average_fps=30.0, height=16, width=16)
-
-    monkeypatch.setattr(module, "probe_video", fake_probe_video)
-
-    assert module._num_available_video_frames(b"sekai-video") == 37
-    assert seen == [b"sekai-video"]
-
-
-def test_sekai_fit_window_clamps_to_available_span() -> None:
-    module = _import_or_skip("projects.cosmos3.sil.omnidreams.datasets.sekai")
-
-    assert module._fit_window_to_available_video(
-        frame_start=20,
-        num_video_frames=8,
-        stride=2,
-        num_available_frames=30,
-    ) == (20, 5)
-    assert module._fit_window_to_available_video(
-        frame_start=100,
-        num_video_frames=8,
-        stride=3,
-        num_available_frames=10,
-    ) == (0, 4)
+    assert not any("normalize" in type(augmentor).__name__.lower() for augmentor in augmentations)

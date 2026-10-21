@@ -5,14 +5,19 @@
 
 from __future__ import annotations
 
+import copy
+import math
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
 
+from cosmos_framework.data.generator.sequence_packing.modality import ModalityData
 from cosmos_framework.data.generator.sequence_packing.sequence import PackedSequence, PackedSequenceBuilder, SequencePlan
 from cosmos_framework.data.generator.sequence_packing.temporal_causal import pack_supertokens_temporal_causal
 
 if TYPE_CHECKING:
+    from cosmos_framework.configs.base.defaults.model_config import MultiviewActionConditioningConfig
     from cosmos_framework.model.generator.utils.data_and_condition import GenerationDataClean
 
 
@@ -37,6 +42,285 @@ def _get_optional_fps(
     return float(fps_value)
 
 
+def validate_cross_view_fps(
+    sequence_plans: list[SequencePlan],
+    gen_data_clean: GenerationDataClean,
+    *,
+    require_single_view: bool = False,
+    separate_camera_items: bool = False,
+) -> None:
+    """Require real capture clocks for cross-view attention or same-view windows.
+
+    Call before packing replaces absent FPS with a fallback clock. Single-view,
+    single-sensor samples have no cross-view edges and need no capture clock here
+    unless ``require_single_view`` is set for a same-view window measured in seconds.
+    Control items share their target's view groups, so item count alone does not
+    make a sample cross-view. Set ``separate_camera_items`` only for the action
+    conditioning layout with one RGB item per camera, rather than control/target
+    items. Sensor FPS remains indexed by sample, not by vision item. Same-view
+    windows also require action-control FPS, indexed by action item.
+    """
+    vision_cursor = 0
+    action_cursor = 0
+    for sample_idx, plan in enumerate(sequence_plans):
+        action_idx = action_cursor
+        action_cursor += int(plan.has_action)
+        vision_views = 0
+        if plan.has_vision:
+            num_items = (
+                gen_data_clean.num_vision_items_per_sample[sample_idx]
+                if gen_data_clean.num_vision_items_per_sample is not None
+                else 1
+            )
+            if separate_camera_items:
+                vision_views = num_items
+            else:
+                vision_views = (
+                    max(gen_data_clean.num_views_per_vision_item[vision_cursor : vision_cursor + num_items], default=0)
+                    if gen_data_clean.num_views_per_vision_item is not None
+                    else 1
+                )
+            vision_cursor += num_items
+        if not require_single_view and vision_views + int(plan.has_lidar) + int(plan.has_radar) <= 1:
+            continue
+        for modality, present, fps_values, fps_idx in (
+            ("vision", plan.has_vision, gen_data_clean.fps_vision, sample_idx),
+            ("lidar", plan.has_lidar, gen_data_clean.fps_lidar, sample_idx),
+            ("radar", plan.has_radar, gen_data_clean.fps_radar, sample_idx),
+            ("action", require_single_view and plan.has_action, gen_data_clean.fps_action, action_idx),
+        ):
+            if not present:
+                continue
+            fps = _get_optional_fps(fps_values, fps_idx)
+            if fps is None or fps <= 0 or not math.isfinite(fps):
+                raise ValueError(
+                    "Multiview attention requires positive, finite "
+                    f"fps_{modality} for sample {sample_idx}; got {fps!r}."
+                )
+
+
+def resolve_item_condition_frames(
+    stream_condition_frames: list[int],
+    *,
+    item_idx: int,
+    num_items: int,
+    latent_t: int,
+) -> list[int]:
+    """Return the clean (conditioning) latent frames of one item of a stream.
+
+    With several items, all but the last are clean controls and the last carries the plan's
+    ``stream_condition_frames``, which is the positional convention the packer has always
+    followed. Shared with the inference decode path so the packer's notion of which items are
+    generated and the decoder's cannot drift apart.
+    """
+    if num_items > 1 and item_idx < num_items - 1:
+        return list(range(latent_t))
+    return stream_condition_frames
+
+
+def is_item_generated(
+    stream_condition_frames: list[int],
+    *,
+    item_idx: int,
+    num_items: int,
+    latent_t: int,
+) -> bool:
+    """Whether any latent frame of one item is noised, and so supervised or sampled."""
+    condition_frames = resolve_item_condition_frames(
+        stream_condition_frames, item_idx=item_idx, num_items=num_items, latent_t=latent_t
+    )
+    clean_frames = {idx for idx in condition_frames if 0 <= idx < latent_t}
+    return len(clean_frames) < latent_t
+
+
+def expand_multiview_condition_frame_indexes(
+    condition_frame_indexes_vision: list[int],
+    *,
+    condition_view_indexes_vision: list[int] | None,
+    num_views: int,
+    latent_t: int,
+) -> list[int]:
+    """Map per-view-local latent frame indexes to camera-major flat indexes.
+
+    Per-camera VAE encoding concatenates view latents as
+    ``[view0 frames | view1 frames | ...]``. ``SequencePlan.condition_frame_indexes_vision``
+    stores the same per-view-local indexes used for single-view transfer (e.g. ``[0]`` for
+    one conditioning frame). When ``num_views > 1``, expand so each listed local frame is
+    conditioned for every selected camera. Complete camera views listed in
+    ``condition_view_indexes_vision`` are then unioned into the resulting flat indexes.
+    """
+    condition_view_indexes_vision = condition_view_indexes_vision or []
+    if len(condition_view_indexes_vision) != len(set(condition_view_indexes_vision)):
+        raise ValueError(
+            "condition_view_indexes_vision must not contain duplicate camera indexes: "
+            f"got {condition_view_indexes_vision}."
+        )
+    invalid_view_indexes = [idx for idx in condition_view_indexes_vision if not (0 <= idx < num_views)]
+    if invalid_view_indexes:
+        raise ValueError(
+            "condition_view_indexes_vision contains camera indexes outside the sampled view range "
+            f"[0, {num_views}): {invalid_view_indexes}."
+        )
+    if num_views <= 1 and not condition_view_indexes_vision:
+        return condition_frame_indexes_vision
+    if not condition_frame_indexes_vision and not condition_view_indexes_vision:
+        return []
+    if latent_t % num_views != 0:
+        raise ValueError(
+            "Multiview vision conditioning requires latent_t divisible by num_views: "
+            f"got latent_t={latent_t}, num_views={num_views}."
+        )
+
+    frames_per_view = latent_t // num_views
+    expanded: list[int] = []
+    seen: set[int] = set()
+    for local_frame_idx in condition_frame_indexes_vision:
+        if not (0 <= local_frame_idx < frames_per_view):
+            continue
+        for view_idx in range(num_views):
+            flat_idx = view_idx * frames_per_view + local_frame_idx
+            if flat_idx not in seen:
+                seen.add(flat_idx)
+                expanded.append(flat_idx)
+    for view_idx in condition_view_indexes_vision:
+        for local_frame_idx in range(frames_per_view):
+            flat_idx = view_idx * frames_per_view + local_frame_idx
+            if flat_idx not in seen:
+                seen.add(flat_idx)
+                expanded.append(flat_idx)
+    return sorted(expanded)
+
+
+def uses_single_timestep(input_timesteps: torch.Tensor) -> bool:
+    """Whether every entry of ``input_timesteps`` is the same scalar.
+
+    This gates the timestep-embedding fast path in
+    ``Cosmos3VFMNetwork._embed_packed_timesteps``, which embeds ``timesteps[:1]``
+    and broadcasts the result over every noisy token. The flag is therefore a
+    statement about timestep *values*: it must be false whenever any two noised
+    tokens carry different timesteps, and it is safe whenever they do not,
+    regardless of batch size or tensor shape.
+
+    Callers hold a CPU tensor -- ``pack_input_sequence`` rejects CUDA input --
+    so reading the values costs no device synchronization.
+    """
+    if input_timesteps.numel() == 0:
+        return False
+    flat = input_timesteps.reshape(-1)
+    return bool((flat == flat[0]).all())
+
+
+def replicate_multiview_actions(
+    data: GenerationDataClean, *, num_views: int, temporal_factor: int, action_dim: int
+) -> GenerationDataClean:
+    """Replicate all frame-rate actions camera-major; leave single-view data untouched."""
+    if data.num_vision_items_per_sample is None:
+        return data
+    if data.num_vision_items_per_sample != [num_views] * data.batch_size:
+        raise ValueError("Multiview action conditioning requires one RGB item per configured view and no controls.")
+    assert data.x0_tokens_vision is not None and data.x0_tokens_action is not None
+    actions: list[torch.Tensor] = []
+    domains: list[torch.Tensor] = []
+    for sample, raw_action in enumerate(data.x0_tokens_action):
+        latent_t = data.x0_tokens_vision[num_views * sample].shape[2]
+        if (
+            raw_action.ndim != 2
+            or raw_action.shape[1] != action_dim
+            or raw_action.shape[0] != (latent_t - 1) * temporal_factor
+        ):
+            raise ValueError(f"Multiview requires all {action_dim}D frame-rate actions aligned to T+1 observations.")
+        actions.append(raw_action.repeat(num_views, 1))
+        if data.action_domain_id is not None:
+            domain = data.action_domain_id[sample].reshape(-1)
+            if domain.numel() not in (1, raw_action.shape[0]):
+                raise ValueError("Action domains must be scalar or have one ID per frame-rate action.")
+            domains.append(domain.repeat(num_views) if domain.numel() > 1 else domain)
+    return replace(
+        data,
+        x0_tokens_action=actions,
+        raw_state_action=actions,
+        action_domain_id=domains or None,
+        num_views_per_action_item=[num_views] * data.batch_size,
+    )
+
+
+def pack_multiview_action_conditioning(
+    plans: list[SequencePlan],
+    text_tokens: list[list[int]],
+    data: GenerationDataClean,
+    timesteps: torch.Tensor,
+    *,
+    config: MultiviewActionConditioningConfig,
+    special_tokens: dict[str, int],
+    patch_spatial: int,
+    temporal_factor: int,
+    temporal_margin: int,
+    base_fps: float,
+) -> PackedSequence:
+    """Pack separate RGB and full frame-rate action blocks with synchronized ragged views."""
+    num_views = len(config.view_codes)
+    if data.num_vision_items_per_sample != [num_views] * data.batch_size:
+        raise ValueError("Multiview action batches must match the configured view count.")
+    assert data.x0_tokens_vision is not None and data.x0_tokens_action is not None
+    builder = PackedSequenceBuilder(uses_single_timestep=uses_single_timestep(timesteps))
+    for sample, plan in enumerate(plans):
+        if not plan.has_vision or not plan.has_action or plan.has_sound or plan.has_lidar or plan.has_radar:
+            raise ValueError("Multiview action conditioning supports RGB + conditioned action forward dynamics only.")
+        sample_start = builder.current_seq_index
+        builder.set_mrope_temporal_offset(0)
+        builder.pack_text_tokens(text_tokens[sample], special_tokens, has_generation=True, use_float_positions=True)
+        builder.advance_mrope_temporal_offset(temporal_margin)
+        temporal_offset = builder.mrope_temporal_offset
+        fps = float(data.fps_vision[sample]) if data.fps_vision is not None else base_fps
+        views = data.x0_tokens_vision[num_views * sample : num_views * (sample + 1)]
+        latent_t = views[0].shape[2]
+        if any(view.shape[2] != latent_t for view in views):
+            raise ValueError("All views must share latent time, even when their spatial grids differ.")
+        action = data.x0_tokens_action[sample]
+        actions_per_view = (latent_t - 1) * temporal_factor
+        if action.ndim != 2 or action.shape[0] != num_views * actions_per_view:
+            raise ValueError("All frame-rate actions must be replicated camera-major without temporal subsampling.")
+        # Fixed codes occupy configured padded slots after normalization;
+        # fully conditioned frame-rate actions bypass RF masking.
+        action = action.clone()
+        # Torch probing OmegaConf containers retains caller-frame tensors until
+        # cyclic GC; materialize plain lists before passing codes to Torch.
+        codes = action.new_tensor([list(code) for code in config.view_codes])
+        start = config.view_code_start
+        action.reshape(num_views, actions_per_view, action.shape[1])[..., start : start + codes.shape[1]] = codes[
+            :, None, :
+        ]
+        generation_start = builder.current_seq_index
+        for view in views:
+            builder.set_mrope_temporal_offset(temporal_offset)
+            builder.pack_vision_tokens(
+                view,
+                plan.condition_frame_indexes_vision,
+                float(timesteps[sample].flatten()[0]),
+                patch_spatial,
+                fps,
+                True,
+                base_fps,
+                temporal_factor,
+                None,
+                None,
+            )
+        builder.pack_action_tokens(
+            action,
+            list(range(action.shape[0])),
+            0.0,
+            action_temporal_offset=temporal_offset,
+            enable_fps_modulation=True,
+            base_fps=base_fps,
+            action_fps=fps,
+            base_temporal_compression_factor=temporal_factor,
+            action_start_frame_offset=1,
+            num_views=num_views,
+        )
+        builder.finish_sample(builder.current_seq_index - generation_start, builder.current_seq_index - sample_start)
+    return builder.finalize(gen_data_clean=data)
+
+
 def pack_input_sequence(
     sequence_plans: list[SequencePlan],
     input_text_indexes: list[list[int]],
@@ -56,7 +340,11 @@ def pack_input_sequence(
     vision_temporal_position_mode: str = "latent_index",
     video_temporal_causal: bool = False,
     action_dim: int = 32,
-    initial_mrope_temporal_offset: int | float = 0,
+    initial_mrope_temporal_offset: int | float | list[int | float] = 0,
+    lidar_temporal_compression_factor: int | None = None,
+    radar_temporal_compression_factor: int | None = None,
+    lidar_patch_spatial_hw: int | tuple[int, int] | None = None,
+    radar_patch_spatial_hw: int | tuple[int, int] | None = None,
 ) -> PackedSequence:
     """
     Pack a sequence of input strings and VAE latents into a packed tensor format.
@@ -66,8 +354,10 @@ def pack_input_sequence(
     Args:
         sequence_plans: List of SequencePlan items describing which modalities are present.
         input_text_indexes: List of text token ID sequences (only for samples where has_text=True).
-        gen_data_clean: GenerationDataClean containing vision, action, and sound tensors.
+        gen_data_clean: GenerationDataClean containing vision, LiDAR, action, and sound tensors.
             - x0_tokens_vision: Vision tensors for samples where has_vision=True
+            - x0_tokens_lidar: LiDAR tensors for samples where has_lidar=True
+            - x0_tokens_radar: Radar tensors for samples where has_radar=True
             - x0_tokens_action: Action tensors for samples where has_action=True
             - x0_tokens_sound: Sound tensors (list of [C, T]) for samples where has_sound=True
         input_timesteps: Diffusion timesteps for each sample. Shape (B,) or (B, 1) for
@@ -76,7 +366,9 @@ def pack_input_sequence(
             sample as a float (numel==1) or Tensor(T_max,) for per-frame indexing.
         special_tokens: Dictionary containing special token IDs (eos_token_id, start_of_generation, end_of_generation)
         max_num_tokens: Maximum number of tokens in the packed sequence
-        latent_patch_size: Patch size used by the network to pack latents
+        latent_patch_size: Patch size used by the network to pack camera latents.
+        lidar_patch_spatial_hw: LiDAR patch side or (height, width); None inherits latent_patch_size.
+        radar_patch_spatial_hw: Radar patch side or (height, width); None inherits latent_patch_size.
         skip_text_tokens: If True, skip packing text tokens
         include_end_of_generation_token: If True, append end-of-generation token
         unified_3d_mrope_reset_spatial_ids: If True (default), spatial (H, W) indices
@@ -94,14 +386,20 @@ def pack_input_sequence(
         temporal_compression_factor: VAE temporal compression factor (default 4).
             Obtained from the VAE tokenizer at runtime.
         vision_temporal_position_mode: Temporal coordinates used for unified_3d_mrope vision tokens.
-            "latent_index" keeps legacy positions; "uniae_source_right_edge" uses
+            "latent_index" uses latent-frame indexes; "uniae_source_right_edge" uses
             per-latent positions from gen_data_clean.temporal_positions_vision.
         video_temporal_causal: If True, pack vision and optional action as temporal-causal
             supertokens instead of separate modality blocks.
         action_dim: Action feature dimension used when temporal-causal packing creates
             null action tokens.
-        initial_mrope_temporal_offset: Initial temporal cursor for each sample, used by
-            autoregressive inference to seed mRoPE positions.
+        initial_mrope_temporal_offset: Initial temporal cursor used by autoregressive
+            inference to seed mRoPE positions. A scalar applies to every sample; a
+            list supplies one offset per sample for batched prompts with different
+            cached text lengths.
+        lidar_temporal_compression_factor: Temporal compression of the LiDAR VAE, obtained
+            from the LiDAR tokenizer at runtime. With the sweep rate in
+            ``gen_data_clean.fps_lidar`` it places LiDAR latents on the same real-time axis
+            as the camera, the way action tokens are placed on it.
 
     Returns:
         PackedSequence containing all packed tensors and metadata. See PackedSequence for field details.
@@ -123,6 +421,31 @@ def pack_input_sequence(
         )
     has_any_vision = any(plan.has_vision for plan in sequence_plans)
     explicit_vision_temporal_positions_active = vision_temporal_position_mode != "latent_index" and has_any_vision
+    has_multiview_vision_items = (
+        has_any_vision
+        and gen_data_clean.num_views_per_vision_item is not None
+        and any(num_views > 1 for num_views in gen_data_clean.num_views_per_vision_item)
+    )
+    has_view_conditioning = any(plan.condition_view_indexes_vision for plan in sequence_plans)
+    if has_view_conditioning and video_temporal_causal:
+        raise NotImplementedError("View completion is not supported by video_temporal_causal packing.")
+    num_action_items = sum(1 for plan in sequence_plans if plan.has_action)
+    num_views_per_action_item = gen_data_clean.num_views_per_action_item
+    if num_views_per_action_item is not None:
+        if len(num_views_per_action_item) != num_action_items:
+            raise ValueError(
+                "num_views_per_action_item must have one entry per dense action item: "
+                f"got {len(num_views_per_action_item)} entries for {num_action_items} action item(s)."
+            )
+        if any(num_views <= 0 for num_views in num_views_per_action_item):
+            raise ValueError(f"num_views_per_action_item values must be positive, got {num_views_per_action_item}.")
+    has_multiview_action_items = num_views_per_action_item is not None and any(
+        num_views > 1 for num_views in num_views_per_action_item
+    )
+    if has_multiview_vision_items and video_temporal_causal:
+        raise NotImplementedError("video_temporal_causal=True is not wired for multiview vision items yet.")
+    if has_multiview_action_items and video_temporal_causal:
+        raise NotImplementedError("video_temporal_causal=True is not wired for multiview action items yet.")
     if explicit_vision_temporal_positions_active:
         if gen_data_clean.temporal_positions_vision is None:
             raise ValueError(
@@ -147,10 +470,27 @@ def pack_input_sequence(
             raise NotImplementedError(
                 "Autoregressive mRoPE temporal offsets are not wired for explicit UniAE vision temporal positions yet."
             )
+    if any(plan.has_lidar for plan in sequence_plans):
+        if gen_data_clean.x0_tokens_lidar is None:
+            raise ValueError("A sequence plan sets has_lidar, but gen_data_clean.x0_tokens_lidar is None.")
+        if video_temporal_causal:
+            raise NotImplementedError("Temporal-causal packing is not wired for the LiDAR stream yet.")
+    if any(plan.has_radar for plan in sequence_plans):
+        if gen_data_clean.x0_tokens_radar is None:
+            raise ValueError("A sequence plan sets has_radar, but gen_data_clean.x0_tokens_radar is None.")
+        if video_temporal_causal:
+            raise NotImplementedError("Temporal-causal packing is not wired for the radar stream yet.")
+
     use_float_mrope_positions = enable_fps_modulation or explicit_vision_temporal_positions_active
 
+    if isinstance(initial_mrope_temporal_offset, list) and len(initial_mrope_temporal_offset) != len(sequence_plans):
+        raise ValueError(
+            "initial_mrope_temporal_offset must contain one value per sequence plan, "
+            f"got {len(initial_mrope_temporal_offset)} offsets for {len(sequence_plans)} plans."
+        )
+
     # Initialize mutable builder state for sequence construction.
-    seq_builder = PackedSequenceBuilder(uses_single_timestep=input_timesteps.numel() == 1)
+    seq_builder = PackedSequenceBuilder(uses_single_timestep=uses_single_timestep(input_timesteps))
 
     # Configure 3D mRoPE on the builder.
     seq_builder._mrope_reset_spatial = unified_3d_mrope_reset_spatial_ids
@@ -158,6 +498,8 @@ def pack_input_sequence(
     # Maintain separate indices for each modality
     idx_text = 0
     idx_vision = 0
+    idx_lidar = 0
+    idx_radar = 0
     idx_action = 0
     idx_sound = 0
     null_action_flags: list[bool] = []  # collected from TC path; asserted consistent after the loop
@@ -174,23 +516,52 @@ def pack_input_sequence(
 
         # mRoPE temporal offset resets per sample.
         # initial_mrope_temporal_offset is non-zero only for AR inference (frame N seeds at N*tcf).
-        seq_builder.begin_sample(initial_mrope_temporal_offset)
+        sample_initial_mrope_temporal_offset = (
+            initial_mrope_temporal_offset[sample_idx]
+            if isinstance(initial_mrope_temporal_offset, list)
+            else initial_mrope_temporal_offset
+        )
+        seq_builder.begin_sample(sample_initial_mrope_temporal_offset)
 
         _ts = input_timesteps[sample_idx]
         input_timestep = _ts.item() if _ts.numel() == 1 else _ts  # float (TF) or Tensor(T_max,) (DF)
 
         # Pack text tokens if has_text=True and not skipped
         if sequence_plan.has_text and not skip_text_tokens:
-            text_ids = input_text_indexes[idx_text]
-            idx_text += 1
-
-            has_generation_for_sample = sequence_plan.has_vision or sequence_plan.has_action or sequence_plan.has_sound
-            text_sample_len = seq_builder.pack_text_tokens(
-                text_ids,
-                special_tokens,
-                has_generation=has_generation_for_sample,
-                use_float_positions=use_float_mrope_positions,
+            has_generation_for_sample = (
+                sequence_plan.has_vision
+                or sequence_plan.has_lidar
+                or sequence_plan.has_radar
+                or sequence_plan.has_action
+                or sequence_plan.has_sound
             )
+            if sequence_plan.text_view_ids is None:
+                text_ids = input_text_indexes[idx_text]
+                idx_text += 1
+                text_sample_len = seq_builder.pack_text_tokens(
+                    text_ids,
+                    special_tokens,
+                    has_generation=has_generation_for_sample,
+                    use_float_positions=use_float_mrope_positions,
+                )
+            else:
+                # Per-view captions: the sample owns one caption per camera, laid consecutively
+                # in input_text_indexes, and they share the sample's single causal split.
+                num_captions = len(sequence_plan.text_view_ids)
+                text_ids_per_view = input_text_indexes[idx_text : idx_text + num_captions]
+                if len(text_ids_per_view) != num_captions:
+                    raise ValueError(
+                        f"Sample {sample_idx} declares {num_captions} per-view captions but only "
+                        f"{len(text_ids_per_view)} remain in input_text_indexes."
+                    )
+                idx_text += num_captions
+                text_sample_len = seq_builder.pack_text_tokens_per_view(
+                    text_ids_per_view,
+                    sequence_plan.text_view_ids,
+                    special_tokens,
+                    has_generation=has_generation_for_sample,
+                    use_float_positions=use_float_mrope_positions,
+                )
             sample_len += text_sample_len
 
             # End of text modality, add an offset as the boundary between text and vision.
@@ -203,33 +574,88 @@ def pack_input_sequence(
         if video_temporal_causal and sequence_plan.has_vision:
             # Temporal causal path: when sequence_plan.has_action=True, interleaved supertokens
             # [action_t, vision_t]; when False, supertokens are just vision patches.
-            input_vision_tokens = gen_data_clean.x0_tokens_vision[idx_vision]
-            idx_vision += 1
+            # Transfer training owns two aligned vision items (clean control, then target).
+            # Pack both as separate payloads while sharing their temporal mRoPE grid; the
+            # teacher-forcing attention path uses the recorded item lengths to keep control
+            # and target visibility distinct.
+            num_vis = (
+                gen_data_clean.num_vision_items_per_sample[sample_idx]
+                if gen_data_clean.num_vision_items_per_sample is not None
+                else 1
+            )
+            if num_vis not in (1, 2):
+                raise ValueError(
+                    "Temporal-causal packing supports one vision item, or exactly two aligned "
+                    f"transfer items (control + target); got {num_vis} items for sample {sample_idx}."
+                )
+            if num_vis == 2 and sequence_plan.has_action:
+                raise ValueError("Temporal-causal transfer packing does not support action tokens.")
+            if num_vis == 2 and not sequence_plan.share_vision_temporal_positions:
+                raise ValueError(
+                    "Temporal-causal transfer requires share_vision_temporal_positions=True "
+                    "for aligned control and target frames."
+                )
 
-            vision_fps = _get_optional_fps(gen_data_clean.fps_vision, idx_vision - 1)
+            # FPS is per logical sample, including samples with multiple vision items.
+            vision_fps = _get_optional_fps(gen_data_clean.fps_vision, sample_idx)
 
             input_action_tokens_tc: torch.Tensor | None = None
             action_fps_tc = None
             if sequence_plan.has_action:
-                input_action_tokens_tc = gen_data_clean.x0_tokens_action[idx_action]
+                input_action_tokens_tc = gen_data_clean.x0_tokens_action[idx_action]  # [B,T_action,D]
                 action_fps_tc = _get_optional_fps(gen_data_clean.fps_action, idx_action)
                 idx_action += 1
 
-            supertoken_split_len, null_flag = pack_supertokens_temporal_causal(
-                seq_builder=seq_builder,
-                input_vision_tokens=input_vision_tokens,
-                input_action_tokens=input_action_tokens_tc,
-                condition_frame_indexes_vision=sequence_plan.condition_frame_indexes_vision,
-                input_timestep=input_timestep,
-                latent_patch_size=latent_patch_size,
-                temporal_compression_factor=temporal_compression_factor,
-                action_dim=action_dim,
-                vision_fps=vision_fps,
-                action_fps=action_fps_tc,
-                enable_fps_modulation=enable_fps_modulation,
-                base_fps=base_fps,
-                pack_action_tokens=sequence_plan.has_action,
-            )
+            vision_split_len = 0
+            item_split_lens: list[int] = []
+            item_temporal_offset = seq_builder.mrope_temporal_offset
+            null_flag = False
+            expected_transfer_shape: tuple[int, ...] | None = None
+            for item_idx in range(num_vis):
+                input_vision_tokens = gen_data_clean.x0_tokens_vision[idx_vision]  # [B,C,T,H,W]
+                idx_vision += 1
+                if num_vis == 2:
+                    item_shape = tuple(input_vision_tokens.shape[2:])
+                    if expected_transfer_shape is None:
+                        expected_transfer_shape = item_shape
+                    elif item_shape != expected_transfer_shape:
+                        raise ValueError(
+                            "Temporal-causal transfer requires aligned control and target latent shapes; "
+                            f"got {expected_transfer_shape} and {item_shape}."
+                        )
+                    # Rewind before the target so control_t and target_t receive identical
+                    # temporal coordinates. The target call advances the cursor back to the
+                    # correct single-video high-water mark.
+                    if item_idx > 0:
+                        seq_builder.set_mrope_temporal_offset(item_temporal_offset)
+
+                item_condition_frames = resolve_item_condition_frames(
+                    sequence_plan.condition_frame_indexes_vision,
+                    item_idx=item_idx,
+                    num_items=num_vis,
+                    latent_t=input_vision_tokens.shape[2],
+                )
+                item_split_len, item_null_flag = pack_supertokens_temporal_causal(
+                    seq_builder=seq_builder,
+                    input_vision_tokens=input_vision_tokens,
+                    input_action_tokens=input_action_tokens_tc,
+                    condition_frame_indexes_vision=item_condition_frames,
+                    input_timestep=input_timestep,
+                    latent_patch_size=latent_patch_size,
+                    temporal_compression_factor=temporal_compression_factor,
+                    action_dim=action_dim,
+                    vision_fps=vision_fps,
+                    action_fps=action_fps_tc,
+                    enable_fps_modulation=enable_fps_modulation,
+                    base_fps=base_fps,
+                    pack_action_tokens=sequence_plan.has_action,
+                )
+                vision_split_len += item_split_len
+                item_split_lens.append(item_split_len)
+                null_flag = null_flag or item_null_flag
+
+            if num_vis == 2:
+                seq_builder.vision_item_split_lens.append(item_split_lens)
             null_action_flags.append(null_flag)
             # We assume all samples in a batch share the same has_action layout, so
             # stamp the supertoken layout constant directly here. This is the
@@ -238,9 +664,10 @@ def pack_input_sequence(
             seq_builder.num_action_tokens_per_supertoken = (
                 temporal_compression_factor if sequence_plan.has_action else 0
             )
-            sample_len += supertoken_split_len
-            vision_split_len = supertoken_split_len
-            action_split_len = 0  # Already absorbed into supertoken_split_len
+            sample_len += vision_split_len
+            action_split_len = 0  # Already absorbed into vision_split_len
+            lidar_split_len = 0  # Temporal-causal packing rejects LiDAR above
+            radar_split_len = 0  # Temporal-causal packing rejects radar above
 
         else:
             # Standard path: vision and action packed separately
@@ -264,11 +691,33 @@ def pack_input_sequence(
                 # temporal mRoPE grid. We snapshot the offset before the loop and
                 # rewind to it before each item, so every item produces identical
                 # temporal IDs. Each pack_vision_tokens call still advances the
-                # offset by latent_t internally; in shared-grid mode the post-loop
-                # offset equals snapshot + latent_t (single-clip semantics for
-                # downstream EOV / next-modality tokens).
+                # offset internally; in shared-grid mode the post-loop offset equals
+                # the first item's effective temporal span (T_view when temporal
+                # positions are also shared across camera views).
                 shared_grid = sequence_plan.share_vision_temporal_positions and num_vis > 1
+                temporal_groups = sequence_plan.vision_temporal_position_groups
+                if temporal_groups is not None:
+                    if shared_grid:
+                        raise ValueError(
+                            "Use either share_vision_temporal_positions or vision_temporal_position_groups, not both."
+                        )
+                    if len(temporal_groups) != num_vis:
+                        raise ValueError(
+                            "vision_temporal_position_groups must have one entry per vision item, "
+                            f"got {len(temporal_groups)} groups for {num_vis} items."
+                        )
                 items_temporal_offset_snapshot = seq_builder.mrope_temporal_offset
+                # State for selectively shared temporal grids:
+                # - group_offsets records each group's starting mRoPE offset, which
+                #   later members rewind to before packing.
+                # - group_shapes and group_temporal_positions validate that members
+                #   of a shared group use compatible latent grids and explicit IDs.
+                # - grouped_end_offset tracks the furthest offset reached by either
+                #   grouped or independent items, so downstream tokens follow all of them.
+                group_offsets: dict[int, int | float] = {}
+                grouped_end_offset: int | float = items_temporal_offset_snapshot
+                group_shapes: dict[int, tuple[int, int, int]] = {}
+                group_temporal_positions: dict[int, torch.Tensor] = {}
                 shared_latent_t: int | None = None
                 shared_patch_h: int | None = None
                 shared_patch_w: int | None = None
@@ -295,17 +744,66 @@ def pack_input_sequence(
                             )
                     idx_vision += 1
 
-                    # Determine conditioning for this vision item.
-                    # For multi-item mode: all items except the last are fully conditioned
-                    # (all frames are clean); the last item uses the SequencePlan's
-                    # condition_frame_indexes_vision (typically [] = fully generated).
-                    if num_vis > 1 and item_idx < num_vis - 1:
-                        # Conditioning item (e.g. source image): mark all frames as clean
-                        latent_t = input_vision_tokens.shape[2]
-                        item_condition_frames = list(range(latent_t))
-                    else:
-                        # Generation item (single-item mode or last item in multi-item)
-                        item_condition_frames = sequence_plan.condition_frame_indexes_vision
+                    item_condition_frames = resolve_item_condition_frames(
+                        sequence_plan.condition_frame_indexes_vision,
+                        item_idx=item_idx,
+                        num_items=num_vis,
+                        latent_t=input_vision_tokens.shape[2],
+                    )
+
+                    num_views = 1
+                    if gen_data_clean.num_views_per_vision_item is not None:
+                        num_views = gen_data_clean.num_views_per_vision_item[flat_vision_idx]
+                    elif sequence_plan.condition_view_indexes_vision:
+                        raise ValueError(
+                            "condition_view_indexes_vision requires per-camera VAE metadata in "
+                            "gen_data_clean.num_views_per_vision_item."
+                        )
+                    latent_t = input_vision_tokens.shape[2]
+                    temporal_position_period: int | None = None
+                    if num_views > 1:
+                        if latent_t % num_views != 0:
+                            raise ValueError(
+                                "Aligning temporal positions across views requires latent_t divisible by num_views: "
+                                f"got latent_t={latent_t}, num_views={num_views} for item {flat_vision_idx}."
+                            )
+                        temporal_position_period = latent_t // num_views
+                    item_condition_frames = expand_multiview_condition_frame_indexes(
+                        item_condition_frames,
+                        condition_view_indexes_vision=sequence_plan.condition_view_indexes_vision,
+                        num_views=num_views,
+                        latent_t=latent_t,
+                    )
+
+                    item_group = temporal_groups[item_idx] if temporal_groups is not None else None
+                    if item_group is not None:
+                        item_shape = (
+                            input_vision_tokens.shape[2],
+                            input_vision_tokens.shape[3],
+                            input_vision_tokens.shape[4],
+                        )
+                        if item_group in group_shapes and item_shape != group_shapes[item_group]:
+                            raise ValueError(
+                                "Vision items sharing a temporal-position group must have equal latent shapes, "
+                                f"got {item_shape} and {group_shapes[item_group]} for group {item_group}."
+                            )
+                        group_shapes.setdefault(item_group, item_shape)
+                        if vision_temporal_positions is not None:
+                            if item_group in group_temporal_positions:
+                                expected_positions = group_temporal_positions[item_group]
+                                if not torch.allclose(
+                                    vision_temporal_positions.to(device=expected_positions.device), expected_positions
+                                ):
+                                    raise ValueError(
+                                        "Vision items sharing a temporal-position group must have equal explicit "
+                                        f"temporal positions for group {item_group}."
+                                    )
+                            else:
+                                group_temporal_positions[item_group] = vision_temporal_positions
+                        if item_group in group_offsets:
+                            seq_builder.set_mrope_temporal_offset(group_offsets[item_group])
+                        else:
+                            group_offsets[item_group] = seq_builder.mrope_temporal_offset
 
                     if shared_grid:
                         item_latent_t = input_vision_tokens.shape[2]
@@ -351,11 +849,16 @@ def pack_input_sequence(
                         base_fps=base_fps,
                         temporal_compression_factor=temporal_compression_factor,
                         vision_temporal_positions=vision_temporal_positions,
+                        temporal_position_period=temporal_position_period,
                     )
+                    if temporal_groups is not None:
+                        grouped_end_offset = max(grouped_end_offset, seq_builder.mrope_temporal_offset)
                     vision_split_len += item_split_len
                     if track_item_split_lens:
                         sample_item_split_lens.append(item_split_len)
 
+                if temporal_groups is not None:
+                    seq_builder.set_mrope_temporal_offset(max(grouped_end_offset, seq_builder.mrope_temporal_offset))
                 if track_item_split_lens:
                     seq_builder.vision_item_split_lens.append(sample_item_split_lens)
                 sample_len += vision_split_len
@@ -363,10 +866,121 @@ def pack_input_sequence(
             else:
                 vision_split_len = 0
 
+            # Pack LiDAR tokens if has_lidar=True. They follow this sample's vision items, so
+            # the packed stream reads [camera items | LiDAR items] and the multiview mask can
+            # describe the sample as one item list.
+            if sequence_plan.has_lidar:
+                num_lidar = (
+                    gen_data_clean.num_lidar_items_per_sample[sample_idx]
+                    if gen_data_clean.num_lidar_items_per_sample is not None
+                    else 1
+                )
+                if lidar_temporal_compression_factor is None:
+                    raise ValueError("lidar_temporal_compression_factor must be set when has_lidar=True")
+
+                sample_lidar_fps = _get_optional_fps(gen_data_clean.fps_lidar, sample_idx)
+                if sample_lidar_fps is None:
+                    raise ValueError("sample_lidar_fps must be set when has_lidar=True")
+
+                # Both sensors of a sample were cut from one window, so every LiDAR item starts
+                # where the vision items started and the sample's clock ends at whichever stream
+                # reaches furthest -- a 9.4 s camera clip and the sweeps taken during it.
+                streams_end_offset = seq_builder.mrope_temporal_offset
+
+                lidar_split_len = 0
+                for item_idx in range(num_lidar):
+                    input_lidar_tokens = gen_data_clean.x0_tokens_lidar[idx_lidar]  # [1,C,T,H,W]
+                    idx_lidar += 1
+
+                    item_condition_frames = resolve_item_condition_frames(
+                        sequence_plan.condition_frame_indexes_lidar,
+                        item_idx=item_idx,
+                        num_items=num_lidar,
+                        latent_t=input_lidar_tokens.shape[2],
+                    )
+
+                    seq_builder.set_mrope_temporal_offset(vision_start_temporal_offset)
+                    lidar_split_len += seq_builder.pack_lidar_tokens(
+                        input_lidar_tokens=input_lidar_tokens,
+                        condition_frame_indexes_lidar=item_condition_frames,
+                        input_timestep=input_timestep,
+                        latent_patch_size=(
+                            latent_patch_size if lidar_patch_spatial_hw is None else lidar_patch_spatial_hw
+                        ),
+                        lidar_fps=sample_lidar_fps,
+                        enable_fps_modulation=enable_fps_modulation,
+                        base_fps=base_fps,
+                        temporal_compression_factor=lidar_temporal_compression_factor,
+                        base_temporal_compression_factor=temporal_compression_factor,
+                    )
+                    streams_end_offset = max(streams_end_offset, seq_builder.mrope_temporal_offset)
+
+                seq_builder.set_mrope_temporal_offset(streams_end_offset)
+                sample_len += lidar_split_len
+            else:
+                lidar_split_len = 0
+
+            # Pack radar tokens if has_radar=True. They follow this sample's LiDAR items, so
+            # the packed stream reads [camera items | LiDAR items | radar items] and the
+            # multiview mask still sees one item list per sample.
+            if sequence_plan.has_radar:
+                num_radar = (
+                    gen_data_clean.num_radar_items_per_sample[sample_idx]
+                    if gen_data_clean.num_radar_items_per_sample is not None
+                    else 1
+                )
+                if radar_temporal_compression_factor is None:
+                    raise ValueError("radar_temporal_compression_factor must be set when has_radar=True")
+
+                sample_radar_fps = _get_optional_fps(gen_data_clean.fps_radar, sample_idx)
+                if sample_radar_fps is None:
+                    raise ValueError("sample_radar_fps must be set when has_radar=True")
+
+                # Radar was cut from the same window as the other sensors, so each radar item
+                # starts where the vision items started and only extends the sample's clock if
+                # its scans outlast them.
+                streams_end_offset = seq_builder.mrope_temporal_offset
+
+                radar_split_len = 0
+                for item_idx in range(num_radar):
+                    input_radar_tokens = gen_data_clean.x0_tokens_radar[idx_radar]  # [1,C,T,H,W]
+                    idx_radar += 1
+
+                    item_condition_frames = resolve_item_condition_frames(
+                        sequence_plan.condition_frame_indexes_radar,
+                        item_idx=item_idx,
+                        num_items=num_radar,
+                        latent_t=input_radar_tokens.shape[2],
+                    )
+
+                    seq_builder.set_mrope_temporal_offset(vision_start_temporal_offset)
+                    radar_split_len += seq_builder.pack_radar_tokens(
+                        input_radar_tokens=input_radar_tokens,
+                        condition_frame_indexes_radar=item_condition_frames,
+                        input_timestep=input_timestep,
+                        latent_patch_size=(
+                            latent_patch_size if radar_patch_spatial_hw is None else radar_patch_spatial_hw
+                        ),
+                        radar_fps=sample_radar_fps,
+                        enable_fps_modulation=enable_fps_modulation,
+                        base_fps=base_fps,
+                        temporal_compression_factor=radar_temporal_compression_factor,
+                        base_temporal_compression_factor=temporal_compression_factor,
+                    )
+                    streams_end_offset = max(streams_end_offset, seq_builder.mrope_temporal_offset)
+
+                seq_builder.set_mrope_temporal_offset(streams_end_offset)
+                sample_len += radar_split_len
+            else:
+                radar_split_len = 0
+
             # Pack action tokens if has_action=True
             if sequence_plan.has_action:
-                input_action_tokens = gen_data_clean.x0_tokens_action[idx_action]
+                input_action_tokens = gen_data_clean.x0_tokens_action[idx_action]  # [T_action,D]
                 action_fps = _get_optional_fps(gen_data_clean.fps_action, idx_action)
+                action_num_views = 1
+                if num_views_per_action_item is not None:
+                    action_num_views = num_views_per_action_item[idx_action]
                 idx_action += 1
 
                 action_split_len = seq_builder.pack_action_tokens(
@@ -379,6 +993,7 @@ def pack_input_sequence(
                     action_fps=action_fps,
                     base_temporal_compression_factor=temporal_compression_factor,
                     action_start_frame_offset=sequence_plan.action_start_frame_offset,
+                    num_views=action_num_views,
                 )
                 sample_len += action_split_len
             else:
@@ -406,7 +1021,13 @@ def pack_input_sequence(
 
         # Add end-of-generation token if needed
         eov_len = 0
-        has_any_generation = sequence_plan.has_vision or sequence_plan.has_action or sequence_plan.has_sound
+        has_any_generation = (
+            sequence_plan.has_vision
+            or sequence_plan.has_lidar
+            or sequence_plan.has_radar
+            or sequence_plan.has_action
+            or sequence_plan.has_sound
+        )
         if include_end_of_generation_token and has_any_generation:
             eov_len = seq_builder.append_end_of_generation_token(
                 token_id=special_tokens["end_of_generation"],
@@ -414,7 +1035,9 @@ def pack_input_sequence(
             )
             sample_len += eov_len
 
-        combined_split_len = vision_split_len + action_split_len + sound_split_len + eov_len
+        combined_split_len = (
+            vision_split_len + lidar_split_len + radar_split_len + action_split_len + sound_split_len + eov_len
+        )
         seq_builder.finish_sample(combined_split_len, sample_len)
 
     # Assert consistent null_action_supertokens across all TC samples, then set once
@@ -426,6 +1049,40 @@ def pack_input_sequence(
         seq_builder.null_action_supertokens = null_action_flags[0]
 
     # Finalize and return packed data
-    return seq_builder.finalize(
+    packed = seq_builder.finalize(
         gen_data_clean=gen_data_clean,
     )
+    # Loss normalization counts logical owners, not flattened control/target items.
+    # Keep this metadata outside the token layout so attention packing is unchanged.
+    for name in ("vision", "lidar", "radar", "action", "sound"):
+        counts = getattr(gen_data_clean, f"num_{name}_items_per_sample", None)
+        packed.modality_sample_ids[name] = [
+            sample_index
+            for sample_index, plan in enumerate(sequence_plans)
+            if getattr(plan, f"has_{name}")
+            for _ in range(counts[sample_index] if counts is not None else 1)
+        ]
+    return packed
+
+
+def make_teacher_forcing_clean_pack(
+    packed_seq: PackedSequence,
+) -> PackedSequence:
+    """Return a clean replay pack with generated modalities treated as conditions."""
+    clean_pack = copy.deepcopy(packed_seq)
+    for modality in (clean_pack.vision, clean_pack.lidar, clean_pack.action, clean_pack.sound):
+        if modality is not None:
+            mark_modality_as_clean_condition(modality)
+    return clean_pack
+
+
+def mark_modality_as_clean_condition(modality: ModalityData) -> None:
+    """Clear noised-token metadata for a finalized modality in the TF clean pass."""
+    modality.condition_mask = [torch.ones_like(mask) for mask in modality.condition_mask]  # list[[N_modality]]
+    modality.mse_loss_indexes = torch.empty(
+        0, dtype=modality.mse_loss_indexes.dtype, device=modality.mse_loss_indexes.device
+    )  # [0]
+    modality.timesteps = torch.empty(0, dtype=modality.timesteps.dtype, device=modality.timesteps.device)  # [0]
+    modality.noisy_frame_indexes = [
+        torch.empty(0, dtype=indexes.dtype, device=indexes.device) for indexes in modality.noisy_frame_indexes
+    ]  # list of [0]

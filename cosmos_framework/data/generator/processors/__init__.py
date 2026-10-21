@@ -5,7 +5,7 @@ import json
 import os
 import sys
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional
 
 from transformers import PreTrainedTokenizerFast
 
@@ -13,7 +13,8 @@ from cosmos_framework.data.generator.processors.base import BaseVLMProcessor
 from cosmos_framework.data.generator.processors.cosmos3_edge_processing import is_cosmos3_edge_native_snapshot
 from cosmos_framework.data.generator.processors.nemotron3densevl_processor import Nemotron3DenseVLProcessor
 from cosmos_framework.data.generator.processors.nemotronvl_processor import NemotronVLProcessor
-from cosmos_framework.data.generator.processors.qwen3vl_processor import Qwen3VLProcessor
+from cosmos_framework.data.generator.processors.qwen3vl_nemo_chat_processor import Qwen3VLNemoChatProcessor
+from cosmos_framework.data.generator.processors.qwen3vl_processor import Qwen3VLProcessor, _is_local_qwen35_snapshot
 from cosmos_framework.model.generator.tokenizers.tokenization_qwen2 import Qwen2Tokenizer
 from cosmos_framework.utils.generator.reasoner.pretrained_models_downloader import maybe_download_hf_model_from_s3
 
@@ -29,6 +30,13 @@ _VARIANT_TO_CREDENTIALS = {
 
 # S3 prefix under which HuggingFace model files are stored in the checkpoint buckets.
 _LLM_S3_PREFIX = "cosmos3/pretrained/huggingface"
+
+
+def build_audio_processor(audio_encoder_type: str) -> Any:
+    """Build the raw-audio frontend selected by the Reasoner config."""
+    from cosmos_framework.model.generator.reasoner.audio.registry import get_audio_encoder_backend
+
+    return get_audio_encoder_backend(audio_encoder_type).build_processor()
 
 
 class LLMTokenizerProcessor(BaseVLMProcessor):
@@ -104,16 +112,26 @@ def build_processor(
     credentials: Optional[str] = None,
     bucket: Optional[str] = None,
     cache_dir: Optional[str] = None,
+    use_native_edge_processor: bool = False,
 ):
+    if not isinstance(use_native_edge_processor, bool):
+        raise TypeError("use_native_edge_processor must be a bool")
+    if use_native_edge_processor:
+        if not os.path.isdir(tokenizer_type):
+            raise ValueError("Explicit native Edge processing requires a staged local processor metadata directory")
+        return Nemotron3DenseVLProcessor(tokenizer_type, cache_dir=cache_dir, use_native_edge_processor=True)
     # Local artifact path: source the processor from a bundled directory
     # (e.g. the top level of nvidia/Cosmos3-Nano, which ships its own
     # preprocessor_config.json, tokenizer.json, etc). Avoids the redundant
-    # upstream Qwen/Qwen3-VL-*-Instruct fetch. Cosmos3-Nano/Super both ship
-    # a Qwen3VL-compatible processor, so dispatch to Qwen3VLProcessor —
-    # except renewed Cosmos3-Edge snapshots, which need the Nemotron bridge.
+    # upstream Qwen/Qwen3-VL-*-Instruct fetch. Qwen3-VL Nemo Chat variants use
+    # their specialized loss-mask wrapper. Nemotron3-Dense-VL and renewed
+    # Cosmos3-Edge snapshots use the Nemotron bridge; other local artifacts use
+    # Qwen3VLProcessor.
     if os.path.isdir(tokenizer_type):
-        if is_cosmos3_edge_native_snapshot(tokenizer_type):
+        if is_cosmos3_edge_native_snapshot(tokenizer_type) or "NVIDIA-Nemotron-3-Dense-VL" in tokenizer_type:
             return Nemotron3DenseVLProcessor(tokenizer_type, cache_dir=cache_dir)
+        if "Qwen/Qwen3-VL" in tokenizer_type and "Nemo-Chat" in tokenizer_type:
+            return Qwen3VLNemoChatProcessor(tokenizer_type, cache_dir=cache_dir)
         return Qwen3VLProcessor(tokenizer_type, cache_dir=cache_dir)
     if credentials is None or bucket is None:
         if config_variant is None:
@@ -125,7 +143,15 @@ def build_processor(
         bucket = bucket if bucket is not None else variant_bucket
     elif config_variant is not None:
         raise ValueError("Provide either config_variant or (credentials, bucket), not both")
-    if "Qwen/Qwen3-VL" in tokenizer_type or "Siglip2-Qwen3-1.7B" in tokenizer_type:
+    if "Qwen/Qwen3-VL" in tokenizer_type and "Nemo-Chat" in tokenizer_type:
+        return Qwen3VLNemoChatProcessor(tokenizer_type, credentials=credentials, bucket=bucket, cache_dir=cache_dir)
+    elif (
+        "Qwen/Qwen3-VL" in tokenizer_type
+        or "Siglip2-Qwen3-1.7B" in tokenizer_type
+        or "qwen3.5" in tokenizer_type.lower()
+        or "qwen3_5" in tokenizer_type.lower()
+        or _is_local_qwen35_snapshot(tokenizer_type)
+    ):
         return Qwen3VLProcessor(tokenizer_type, credentials=credentials, bucket=bucket, cache_dir=cache_dir)
     elif "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16" in tokenizer_type:
         return NemotronVLProcessor(tokenizer_type, credentials=credentials, bucket=bucket, cache_dir=cache_dir)

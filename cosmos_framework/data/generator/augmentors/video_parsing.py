@@ -590,6 +590,42 @@ class VideoParsingWithFullFrames(Augmentor):
 
         return True
 
+    def _pop_audio_bytes(self, data_dict: dict, video_bytes: bytes) -> tuple[bytes, str, bool] | None:
+        """Return the selected audio payload and its timeline semantics."""
+        if "audio_bytes" not in data_dict:
+            return video_bytes, "original", False
+
+        external_audio_bytes = data_dict.pop("audio_bytes")
+        audio_source = "external"
+        timeline_is_window_relative = False
+        meta_dict = data_dict.get(self.meta_key)
+        if isinstance(meta_dict, dict):
+            configured_audio_source = meta_dict.get("audio_source")
+            if isinstance(configured_audio_source, str) and configured_audio_source:
+                audio_source = configured_audio_source
+            timeline_is_window_relative = meta_dict.get("audio_timeline_is_window_relative") is True
+        if not isinstance(external_audio_bytes, bytes) or not external_audio_bytes:
+            log.warning(
+                f"Invalid selected {audio_source!r} audio bytes. "
+                f"url: {data_dict.get('__url__')}, key: {data_dict.get('__key__')}",
+                rank0_only=False,
+            )
+            return None
+        return external_audio_bytes, audio_source, timeline_is_window_relative
+
+    @staticmethod
+    def _audio_decode_time_range(
+        audio_time_range: tuple[float, float], timeline_is_window_relative: bool
+    ) -> tuple[float, float]:
+        """Map source-video timestamps onto the selected audio artifact."""
+        if not timeline_is_window_relative:
+            return audio_time_range
+        start_seconds, stop_seconds = audio_time_range
+        # Current video+audio midtraining populations use only starting caption chunks. The selected SAM WAV
+        # begins at that same window, so decode it from local time zero while preserving the selected duration.
+        # Supporting later caption chunks requires carrying their offset relative to the external audio window.
+        return 0.0, stop_seconds - start_seconds
+
     def __call__(self, data_dict: dict) -> dict | None:
         # if in future we need to train with batch size > 1, need to pad frames
         try:
@@ -603,6 +639,15 @@ class VideoParsingWithFullFrames(Augmentor):
 
         if not self._validate_and_probe(video, meta_dict, data_dict):
             return None
+
+        audio_bytes = video
+        audio_source = "original"
+        audio_timeline_is_window_relative = False
+        if self.extract_audio:
+            selected_audio = self._pop_audio_bytes(data_dict, video)
+            if selected_audio is None:
+                return None
+            audio_bytes, audio_source, audio_timeline_is_window_relative = selected_audio
 
         # Resize video frames if size is specified. This computes a scaling ratio that fits the
         # video within the target size bounds while preserving the original aspect ratio.
@@ -628,6 +673,8 @@ class VideoParsingWithFullFrames(Augmentor):
             transform = None
             output_spatial_shape = (meta_dict["height"], meta_dict["width"])
 
+        audio_time_range: tuple[float, float] | None = None
+
         # Adding try-expcept because some of the data is bad and video decoding call fail.
         try:
             video_decoder = VideoDecoder(
@@ -636,10 +683,10 @@ class VideoParsingWithFullFrames(Augmentor):
                 num_ffmpeg_threads=self.video_decode_num_threads,
                 transforms=transform,
             )
-            num_video_frames = len(video_decoder)
+            decoder_len = len(video_decoder)
 
             stride = self._sample_stride_with_bias(self.max_stride, self.min_stride)
-            frame_indices = np.arange(0, num_video_frames, stride).tolist()
+            frame_indices = np.arange(0, decoder_len, stride).tolist()
 
             # Align frame count to the active VAE temporal contract.
             # causal_vae=True: 1+4N (causal VAE, e.g. Wan 2.2).
@@ -673,6 +720,15 @@ class VideoParsingWithFullFrames(Augmentor):
             frame_batch = video_decoder.get_frames_at(frame_indices)
             video_frames = frame_batch.data  # [T,C,H,W]
             video_frames = video_frames.permute(1, 0, 2, 3)  # [C,T,H,W]  (T = num_video_frames)
+            if self.extract_audio:
+                audio_time_range = self._get_audio_time_range(
+                    video_fps=meta_dict["framerate"],
+                    frame_indices=frame_indices,
+                    frame_stride=stride,
+                    frame_end_exclusive=decoder_len,
+                    first_frame_pts_seconds=float(frame_batch.pts_seconds[0].item()),
+                    last_frame_pts_seconds=float(frame_batch.pts_seconds[-1].item()),
+                )
 
             del video_decoder
         except Exception as e:
@@ -694,13 +750,30 @@ class VideoParsingWithFullFrames(Augmentor):
 
         # Extract audio for the same time range as the video frames
         if self.extract_audio:
-            audio_chunk = self._extract_audio_chunk(
-                video_bytes=video, video_fps=meta_dict["framerate"], frame_indices=frame_indices
+            if audio_time_range is not None:
+                audio_time_range = self._audio_decode_time_range(
+                    audio_time_range,
+                    audio_timeline_is_window_relative,
+                )
+            audio_chunk = (
+                None
+                if audio_time_range is None
+                else self._extract_audio_chunk(
+                    audio_bytes=audio_bytes,
+                    start_seconds=audio_time_range[0],
+                    stop_seconds=audio_time_range[1],
+                )
             )
             if audio_chunk is not None:
                 video_info["sound"] = audio_chunk
             else:
                 video_info["sound"] = None
+                if audio_source != "original":
+                    log.warning(
+                        f"Selected {audio_source!r} audio produced no sound. "
+                        f"url: {data_dict.get('__url__')}, key: {data_dict.get('__key__')}",
+                        rank0_only=False,
+                    )
             # Always include audio_sample_rate when extract_audio is enabled,
             # even if audio extraction failed, so the collate function has a
             # consistent set of keys across all samples in the batch.
@@ -713,19 +786,59 @@ class VideoParsingWithFullFrames(Augmentor):
 
         return data_dict
 
+    @staticmethod
+    def _get_audio_time_range(
+        *,
+        video_fps: float,
+        frame_indices: list[int],
+        frame_stride: int,
+        frame_end_exclusive: int,
+        first_frame_pts_seconds: float,
+        last_frame_pts_seconds: float,
+    ) -> tuple[float, float] | None:
+        """Return the PTS interval played by the sampled video frames.
+
+        ``frame_end_exclusive`` is the hard media or caption-chunk boundary. The
+        last sampled frame plays for one full sampled stride unless that boundary
+        is reached first.
+        """
+        if (
+            not frame_indices
+            or not np.isfinite(video_fps)
+            or video_fps <= 0
+            or frame_stride < 1
+            or frame_indices[0] < 0
+            or frame_end_exclusive <= frame_indices[-1]
+            or not np.isfinite(first_frame_pts_seconds)
+            or not np.isfinite(last_frame_pts_seconds)
+            or last_frame_pts_seconds < first_frame_pts_seconds
+        ):
+            return None
+
+        stop_frame_exclusive = min(frame_indices[-1] + frame_stride, frame_end_exclusive)
+        last_frame_span = stop_frame_exclusive - frame_indices[-1]
+        start_seconds = first_frame_pts_seconds
+        stop_seconds = last_frame_pts_seconds + last_frame_span / video_fps
+        if stop_seconds <= start_seconds:
+            return None
+        return start_seconds, stop_seconds
+
     def _extract_audio_chunk(
-        self, video_bytes: bytes, video_fps: float, frame_indices: list[int]
+        self, audio_bytes: bytes, start_seconds: float, stop_seconds: float
     ) -> torch.Tensor | None:  # returns [C,N_audio] or None
-        """Load audio from the clip, resample, and truncate to match video duration.
+        """Load and align audio to a half-open interval on the media timeline.
 
         Args:
-            video_bytes: Raw video bytes
-            video_fps: Video frames per second, used to compute video duration for truncation.
-            frame_indices: Frame indices extracted from the video.
+            audio_bytes: Raw bytes containing either embedded or standalone audio.
+            start_seconds: Inclusive video playback timestamp.
+            stop_seconds: Exclusive video playback timestamp.
 
         Returns:
             Audio tensor of shape (C, N) or None if extraction fails.
         """
+        if not np.isfinite(start_seconds) or not np.isfinite(stop_seconds) or stop_seconds <= start_seconds:
+            return None
+
         try:
             # Quick check: probe container for audio streams before AudioDecoder init.
             # AudioDecoder is slow when no audio stream exists. We use torchcodec._core
@@ -735,7 +848,7 @@ class VideoParsingWithFullFrames(Augmentor):
             try:
                 from torchcodec._core import create_from_bytes, get_container_metadata
 
-                _handle = create_from_bytes(video_bytes)
+                _handle = create_from_bytes(audio_bytes)
                 _meta = get_container_metadata(_handle)
                 _has_audio = _meta.best_audio_stream_index is not None
                 del _handle, _meta
@@ -744,10 +857,11 @@ class VideoParsingWithFullFrames(Augmentor):
             except (ImportError, AttributeError):
                 pass  # Fall through to AudioDecoder if _core API is unavailable
 
-            audio_decoder = AudioDecoder(video_bytes)
+            audio_decoder = AudioDecoder(audio_bytes)
             all_samples = audio_decoder.get_all_samples()
             audio = all_samples.data  # [C,N_orig]
             orig_sr = all_samples.sample_rate
+            audio_pts_seconds = float(all_samples.pts_seconds)
             del audio_decoder, all_samples
 
             if orig_sr != self.audio_sample_rate:
@@ -757,14 +871,27 @@ class VideoParsingWithFullFrames(Augmentor):
                     librosa.resample(audio.numpy(), orig_sr=orig_sr, target_sr=self.audio_sample_rate, axis=-1)
                 )  # [C,N_resampled]
 
-            # Truncate audio to match the extracted video frame duration.
-            if len(frame_indices) > 0 and video_fps > 0:
-                video_duration = (frame_indices[-1] + 1) / video_fps
-                max_audio_samples = int(video_duration * self.audio_sample_rate)
-                if audio.shape[-1] > max_audio_samples:
-                    audio = audio[:, :max_audio_samples]  # [C,N_truncated]
+            target_num_samples = round((stop_seconds - start_seconds) * self.audio_sample_rate)
+            if target_num_samples <= 0 or audio.ndim != 2 or audio.shape[0] == 0:
+                return None
 
-            return audio.clone()  # [C,N_audio]
+            # AudioSamples.pts_seconds is the media timestamp of decoded sample zero.
+            # Place the decoded waveform on the requested video timeline so late audio
+            # starts and early audio ends remain silence instead of shifting the signal.
+            audio_start_offset = round((audio_pts_seconds - start_seconds) * self.audio_sample_rate)
+            source_start = max(-audio_start_offset, 0)
+            destination_start = max(audio_start_offset, 0)
+            copy_num_samples = min(
+                audio.shape[-1] - source_start,
+                target_num_samples - destination_start,
+            )
+            aligned_audio = audio.new_zeros((audio.shape[0], target_num_samples))  # [C,N_target]
+            if copy_num_samples > 0:
+                aligned_audio[:, destination_start : destination_start + copy_num_samples] = audio[
+                    :, source_start : source_start + copy_num_samples
+                ]  # [C,N_overlap]
+
+            return aligned_audio  # [C,N_audio]
 
         except Exception as e:
             log.warning(f"Failed to extract audio: {e}", rank0_only=False)
@@ -790,6 +917,7 @@ class VideoParsingChunkedFrames(VideoParsingWithFullFrames):
 
     def __init__(self, input_keys: list, output_keys: Optional[list] = None, args: Optional[dict] = None) -> None:
         super().__init__(input_keys, output_keys, args)
+        self.keep_metas: bool = self.args.get("keep_metas", False)
 
     def __call__(self, data_dict: dict) -> dict | None:
         # if in future we need to train with batch size > 1, need to pad frames
@@ -804,6 +932,15 @@ class VideoParsingChunkedFrames(VideoParsingWithFullFrames):
 
         if not self._validate_and_probe(video, meta_dict, data_dict):
             return None
+
+        audio_bytes = video
+        audio_source = "original"
+        audio_timeline_is_window_relative = False
+        if self.extract_audio:
+            selected_audio = self._pop_audio_bytes(data_dict, video)
+            if selected_audio is None:
+                return None
+            audio_bytes, audio_source, audio_timeline_is_window_relative = selected_audio
 
         # The chunk frame range must be supplied by an upstream caption-parsing augmentor
         # (e.g. TextTransformForVideoJsonCaption).
@@ -840,6 +977,8 @@ class VideoParsingChunkedFrames(VideoParsingWithFullFrames):
         else:
             transform = None
             output_spatial_shape = (meta_dict["height"], meta_dict["width"])
+
+        audio_time_range: tuple[float, float] | None = None
 
         # Adding try-expcept because some of the data is bad and video decoding call fail.
         try:
@@ -897,6 +1036,15 @@ class VideoParsingChunkedFrames(VideoParsingWithFullFrames):
             frame_batch = video_decoder.get_frames_at(frame_indices)
             video_frames = frame_batch.data  # [T,C,H,W]
             video_frames = video_frames.permute(1, 0, 2, 3)  # [C,T,H,W]  (T = num_video_frames)
+            if self.extract_audio:
+                audio_time_range = self._get_audio_time_range(
+                    video_fps=meta_dict["framerate"],
+                    frame_indices=frame_indices,
+                    frame_stride=stride,
+                    frame_end_exclusive=chunk_end_clamped,
+                    first_frame_pts_seconds=float(frame_batch.pts_seconds[0].item()),
+                    last_frame_pts_seconds=float(frame_batch.pts_seconds[-1].item()),
+                )
 
             del video_decoder
         except Exception as e:
@@ -918,13 +1066,30 @@ class VideoParsingChunkedFrames(VideoParsingWithFullFrames):
 
         # Extract audio for the same time range as the chunk's video frames.
         if self.extract_audio:
-            audio_chunk = self._extract_audio_chunk(
-                video_bytes=video, video_fps=meta_dict["framerate"], frame_indices=frame_indices
+            if audio_time_range is not None:
+                audio_time_range = self._audio_decode_time_range(
+                    audio_time_range,
+                    audio_timeline_is_window_relative,
+                )
+            audio_chunk = (
+                None
+                if audio_time_range is None
+                else self._extract_audio_chunk(
+                    audio_bytes=audio_bytes,
+                    start_seconds=audio_time_range[0],
+                    stop_seconds=audio_time_range[1],
+                )
             )
             if audio_chunk is not None:
                 video_info["sound"] = audio_chunk
             else:
                 video_info["sound"] = None
+                if audio_source != "original":
+                    log.warning(
+                        f"Selected {audio_source!r} audio produced no sound. "
+                        f"url: {data_dict.get('__url__')}, key: {data_dict.get('__key__')}",
+                        rank0_only=False,
+                    )
             # Always include audio_sample_rate when extract_audio is enabled,
             # even if audio extraction failed, so the collate function has a
             # consistent set of keys across all samples in the batch.
@@ -935,9 +1100,10 @@ class VideoParsingChunkedFrames(VideoParsingWithFullFrames):
 
         data_dict[self.video_key] = video_info
 
-        # Cleanup: this augmentor is the last consumer of metas in the json-caption pipeline.
-        # Also drop the chunk range markers now that the chunk has been decoded.
-        data_dict.pop(self.meta_key, None)
+        # Retain metadata only when a downstream audio-caption stage still needs it.
+        if not self.keep_metas:
+            data_dict.pop(self.meta_key, None)
+        # Drop the chunk range markers now that the chunk has been decoded.
         data_dict.pop("chunk_start_frame", None)
         data_dict.pop("chunk_end_frame", None)
 

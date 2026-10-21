@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
+from importlib.metadata import PackageNotFoundError, version
+
 from hydra.core.config_store import ConfigStore
 
 from cosmos_framework.configs.base.defaults.reasoner import VLMConfig
@@ -36,6 +38,8 @@ qwen3_vl_30b_a3b_instruct = PolicyConfig(backbone=VLMConfig(model_name="Qwen/Qwe
 
 qwen3_vl_30b_a3b_thinking = PolicyConfig(backbone=VLMConfig(model_name="Qwen/Qwen3-VL-30B-A3B-Thinking"))
 
+qwen3_vl_235b_a22b_instruct = PolicyConfig(backbone=VLMConfig(model_name="Qwen/Qwen3-VL-235B-A22B-Instruct"))
+
 qwen3_vl_235b_a22b_thinking = PolicyConfig(backbone=VLMConfig(model_name="Qwen/Qwen3-VL-235B-A22B-Thinking"))
 
 qwen3_vl_8b_thinking = PolicyConfig(backbone=VLMConfig(model_name="Qwen/Qwen3-VL-8B-Thinking"))
@@ -54,12 +58,31 @@ qwen3_vl_32b_instruct = PolicyConfig(backbone=VLMConfig(model_name="Qwen/Qwen3-V
 
 nemotron_nano_12b_v2_vl_bf16 = PolicyConfig(backbone=VLMConfig(model_name="nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"))
 
+signemo_vl_2b = PolicyConfig(
+    backbone=VLMConfig(model_name="nvidia/NVIDIA-Nemotron-3-Dense-VL-2B-BF16-Alignment"), model_max_length=16000
+)
+
 # Cosmos3-Edge reasoner (Nemotron-2B-Dense-VL LM + SigLIP2 vision tower).
 # model_name is the public (ungated) omni release nvidia/Cosmos3-Edge,
 # model_type "cosmos3_edge" (native HF metadata, no remote code; classes are
 # registered in-framework). Reasoner weights load directly from the snapshot —
 # the training loader follows its root safetensors index; no converter step.
-cosmos3_edge_reasoner = PolicyConfig(backbone=VLMConfig(model_name="nvidia/Cosmos3-Edge"))
+# The default "cosmos" adapter is Qwen3-VL-specific and rejects Edge's
+# explicit attention mask, so Edge must not inherit it. Prefer flash-attn-2
+# where its wheels exist (x86); fall back to SDPA elsewhere (e.g. aarch64).
+# An explicit attn_implementation in the experiment TOML still wins.
+try:
+    # FA4 also owns the flash_attn namespace. Check the FA2 distribution without
+    # importing a CUDA extension or initializing CUDA while composing configs.
+    _HAS_FLASH_ATTN_2 = version("flash_attn").split(".", 1)[0] == "2"
+except PackageNotFoundError:
+    _HAS_FLASH_ATTN_2 = False
+_EDGE_ATTN_IMPLEMENTATION = "flash_attention_2" if _HAS_FLASH_ATTN_2 else "sdpa"
+
+cosmos3_edge_reasoner = PolicyConfig(
+    backbone=VLMConfig(model_name="nvidia/Cosmos3-Edge"),
+    attn_implementation=_EDGE_ATTN_IMPLEMENTATION,
+)
 
 
 def register_vlm_policy():
@@ -105,6 +128,12 @@ def register_vlm_policy():
         package="model.config.policy",
         name="qwen3_vl_30b_a3b_thinking",
         node=qwen3_vl_30b_a3b_thinking,
+    )
+    cs.store(
+        group="vlm_policy",
+        package="model.config.policy",
+        name="qwen3_vl_235b_a22b_instruct",
+        node=qwen3_vl_235b_a22b_instruct,
     )
     cs.store(
         group="vlm_policy",
@@ -159,6 +188,12 @@ def register_vlm_policy():
         package="model.config.policy",
         name="nemotron_nano_12b_v2_vl_bf16",
         node=nemotron_nano_12b_v2_vl_bf16,
+    )
+    cs.store(
+        group="vlm_policy",
+        package="model.config.policy",
+        name="signemo_vl_2b",
+        node=signemo_vl_2b,
     )
     cs.store(
         group="vlm_policy",

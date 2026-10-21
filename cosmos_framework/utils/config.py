@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import os
 import sys
 import time
@@ -22,11 +23,15 @@ try:
 
     USE_MEGATRON = True
 except ImportError:
+    # attrs/cattrs resolve postponed annotations even when this optional
+    # backend is unavailable; its only valid configuration then is None.
+    from types import NoneType as ModelParallelConfig
+
     USE_MEGATRON = False
 
+from cosmos_framework.utils import distributed
 from cosmos_framework.utils.lazy_config import LazyCall as L
 from cosmos_framework.utils.lazy_config import LazyDict
-from cosmos_framework.utils import distributed
 from cosmos_framework.utils.misc import Color
 
 T = TypeVar("T")
@@ -185,14 +190,14 @@ class HFExportConfig:
 @make_freezable
 @attrs.define(slots=False)
 class JobConfig:
-    # Project name.
+    # Project name used for output, checkpoint, and resume paths.
     project: str = ""
     # Experiment name.
     group: str = ""
     # Run/job name.
     name: str = ""
-    # W&B mode, can be "online", or "disabled".
-    wandb_mode: str = "online"
+    # W&B is opt-in; use "online" or "offline" to enable logging.
+    wandb_mode: str = "disabled"
     # Cluster configuration (optional, for cluster-specific settings).
     cluster: Optional[Any] = None
 
@@ -288,6 +293,9 @@ class CheckpointConfig:
 
     # Save the checkpoint every N iterations.
     save_iter: int = 999999999
+    # Save every N completed epochs when trainer.steps_per_epoch is configured.
+    # A positive value takes priority over save_iter.
+    save_freq_in_epoch: int = 0
 
     # Load state_dict to the models in strict mode. If True, `allow_partial_load` in dcp
     # planner will be set to False. DCP will raise an error if there are missing keys.
@@ -301,9 +309,9 @@ class CheckpointConfig:
     # Path of model weights to resume the checkpoint from.
     load_path: str = ""
 
-    # The following 3 flags (load_training_state, only_load_scheduler_state, keys_to_skip_loading)
-    # only take effect when the checkpoints are loaded from `load_path`. If loading happens from
-    # the previous checkpoint of the same model, these flags are ignored.
+    # The following flags (load_training_state, only_load_scheduler_state, keys_to_skip_loading,
+    # keys_not_to_resume) only take effect when checkpoints are loaded from `load_path`.
+    # If loading happens from the previous checkpoint of the same model, these flags are ignored.
 
     # Whether to load the training states (optimizer/scheduler/grad-scaler) from the checkpoint path.
     load_training_state: bool = False
@@ -328,7 +336,8 @@ class CheckpointConfig:
     # Print detailed information during checkpoint saving/loading.
     verbose: bool = True
 
-    # Keys not to resume from the checkpoint, choices: ["model", "optim", "scheduler", "trainer", "dataloader"]
+    # Checkpoint components not to resume when warm-starting from `load_path`.
+    # Choices: ["model", "optim", "scheduler", "trainer", "dataloader"]
     keys_not_to_resume: list[str] = []
 
     # Whether to use the local filesystem for broadcasting checkpoint data (used for Tensor Parallel Checkpointer).
@@ -392,7 +401,7 @@ class Profiling:
     # CUDA memory snapshot: set this True to dump allocator snapshots.
     enable_memory_snapshot: bool = False
     save_s3: bool = False
-    profile_freq: int = 1
+    profile_freq: int = 100
     # Number of warmup iterations before the active profile iterations.
     profile_warmup: int = 3
     # Number of consecutive active iterations to capture in one trace.
@@ -403,8 +412,8 @@ class Profiling:
     # Set `record_shape` and `profile_memory` to False to reduce profile size.
     record_shape: bool = False
     profile_memory: bool = False
-    with_stack: bool = True
-    with_modules: bool = True
+    with_stack: bool = False
+    with_modules: bool = False
 
 
 @make_freezable
@@ -453,6 +462,10 @@ class TrainerConfig:
     grad_scaler_args: dict = attrs.field(factory=lambda: dict(enabled=False))
     # Maximum number of iterations to train the model.
     max_iter: int = 999999999
+    # Native epoch schedule. When both values are positive, the trainer runs
+    # num_epochs * steps_per_epoch optimizer updates and reports epoch progress.
+    num_epochs: int | None = None
+    steps_per_epoch: int | None = None
     # Maximum number of iterations to validate the model. If None, validate on the entire dataset.
     max_val_iter: int | None = None
     # How often we log the training stats.
@@ -461,6 +474,11 @@ class TrainerConfig:
     run_validation: bool = True
     # How often we evaluate on the validation set.
     validation_iter: int = 999999999
+    # Validate every N completed epochs. A positive value takes priority over
+    # validation_iter when steps_per_epoch is configured.
+    validation_freq_in_epoch: int = 0
+    # Keep a bounded validation iterator alive so its worker can prefetch between validation calls.
+    prefetch_validation: bool = False
     # Whether to run the validation on the start of the training.
     run_validation_on_start: bool = False
     # Kill the process after N seconds since the last iteration (usually means dead job).
@@ -504,16 +522,17 @@ class Config:
     # Trainer configs.
     trainer: TrainerConfig = attrs.field(factory=TrainerConfig)
 
+    model_parallel: ModelParallelConfig | None
     if USE_MEGATRON:
         # Megatron-Core configs
-        model_parallel: ModelParallelConfig = attrs.field(factory=ModelParallelConfig)
+        model_parallel = attrs.field(factory=ModelParallelConfig)
     else:
-        model_parallel: None = None
+        model_parallel = None
 
     # Checkpointer configs.
     checkpoint: CheckpointConfig = attrs.field(factory=CheckpointConfig)
 
-    # enable upload reproducible setup to s3
+    # Upload additional reproducibility artifacts to S3. Remotely saved jobs upload config.yaml independently.
     upload_reproducible_setup: bool = False
 
     def pretty_print(self, use_color: bool = False) -> str:
@@ -524,6 +543,12 @@ class Config:
 
     def validate(self) -> None:
         """Validate that the config has all required fields."""
+
+        # The broadcast below is the job's first world-size collective, so it is where the world NCCL
+        # communicator actually gets built. Build it explicitly and under a deadline first, so a
+        # cross-domain fabric fault reports itself here instead of hanging inside config validation
+        # until an external reaper reclaims the allocation.
+        distributed.ensure_world_communicator()
 
         # broadcast job.name across all ranks to make sure it is consistent
         # otherwise, unaligned job names leads unaligned path to save checkpoints
@@ -536,11 +561,18 @@ class Config:
         assert self.job.name != ""
 
 
-def load_config(config_path: str, opts: list[str], enable_one_logger: bool = False) -> Config:
+def load_config(
+    config_path: str,
+    opts: list[str],
+    enable_one_logger: bool = False,
+    experiment_module: str | None = None,
+) -> Config:
     from cosmos_framework.utils.serialization import from_yaml, load_callable
 
     t1 = time.monotonic_ns()
     if config_path.endswith(".yaml"):
+        if experiment_module is not None:
+            raise ValueError("experiment_module is only supported for Python configs")
         config = from_yaml(config_path)
         # for registration of dataloaders, etc.
         _ = load_callable(config.__module__).make_config()
@@ -549,7 +581,7 @@ def load_config(config_path: str, opts: list[str], enable_one_logger: bool = Fal
 
         config = override(config, opts, remove_defaults=True)
     else:
-        config = _load_py_config(config_path, opts, validate=False)
+        config = _load_py_config(config_path, opts, validate=False, experiment_module=experiment_module)
 
     if enable_one_logger:
         try:
@@ -563,12 +595,24 @@ def load_config(config_path: str, opts: list[str], enable_one_logger: bool = Fal
         except ImportError:
             pass
 
+    if TRAINING:
+        # Imported here for the same reason ``TrainerConfig.callbacks`` is declared under
+        # TRAINING: the callback stack it pulls in is training-only.
+        from cosmos_framework.utils.callback import ensure_async_checkpoint_confirmation
+
+        config = ensure_async_checkpoint_confirmation(config)
+
     t2 = time.monotonic_ns()
     logging.debug(f"total time to load config: {(t2 - t1) / 1e6:.2f}ms")
     return config
 
 
-def _load_py_config(config_path: str, opts: list[str], validate: bool = True) -> Config:
+def _load_py_config(
+    config_path: str,
+    opts: list[str],
+    validate: bool = True,
+    experiment_module: str | None = None,
+) -> Config:
     # NOTE: circular dependency
     from cosmos_framework.utils.config_helper import get_config_module, override
 
@@ -578,7 +622,20 @@ def _load_py_config(config_path: str, opts: list[str], validate: bool = True) ->
     logging.debug(f"get_config_module: took {(t2 - t1) / 1e6:.2f}ms")
 
     t1 = time.monotonic_ns()
-    config = importlib.import_module(config_module).make_config()
+    config_factory = importlib.import_module(config_module).make_config
+    if experiment_module is None:
+        config = config_factory()
+    else:
+        parameters = inspect.signature(config_factory).parameters
+        accepts_experiment_module = "experiment_module" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        )
+        if not accepts_experiment_module:
+            raise ValueError(
+                f"{config_module}.make_config() does not accept experiment_module; "
+                "remove --experiment-module or update make_config()"
+            )
+        config = config_factory(experiment_module=experiment_module)
     t2 = time.monotonic_ns()
     logging.debug(f"importlib.import_module: took {(t2 - t1) / 1e6:.2f}ms")
 

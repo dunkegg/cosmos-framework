@@ -18,11 +18,11 @@ from __future__ import annotations
 
 from typing import Any
 
-
 # Maps ``job.task`` to the base Hydra config that ``make_config()`` lives in.
 TASK_TO_BASE_CONFIG: dict[str, str] = {
     "vfm": "cosmos_framework/configs/base/config.py",
     "vlm": "cosmos_framework/configs/base/reasoner/config.py",
+    "simulation": "cosmos_framework/configs/simulation/config.py",
 }
 
 
@@ -43,6 +43,14 @@ TASK_TO_BASE_CONFIG: dict[str, str] = {
 #   - Rename a field's Hydra path: map its prefix to the new prefix tuple.
 # ---------------------------------------------------------------------------
 PATH_REMAPS: dict[str, dict[tuple[str, ...], "tuple[str, ...] | None"]] = {
+    # Simulation shares the model.config layout, but not vision-SFT's nested
+    # dataset path. Keep model-specific data and distillation fields in recipes.
+    "simulation": {
+        ("job", "upload_reproducible_setup"): ("upload_reproducible_setup",),
+        ("model", "attn_implementation"): None,
+        ("model", "backbone"): None,
+        ("model",): ("model", "config"),
+    },
     # VFM (OmniMoTModelConfig): every ``model.<X>`` lives at
     # ``model.config.<X>`` in the Hydra tree. ``attn_implementation`` is a
     # VLM-only knob — skip it on VFM. Other sections pass through.
@@ -52,6 +60,12 @@ PATH_REMAPS: dict[str, dict[tuple[str, ...], "tuple[str, ...] | None"]] = {
         ("job", "upload_reproducible_setup"): ("upload_reproducible_setup",),
         ("model", "attn_implementation"): None,
         ("model", "backbone"): None,                                           # VLM-only — VFM has no model.config.backbone
+        ("model", "lora_dropout"): None,
+        ("model", "lora_bias"): None,
+        ("model", "lora_use_rslora"): None,
+        ("model", "lora_modules_to_save"): None,
+        ("model", "lora_precision"): None,
+        ("model", "qwen3_vl_patch_embed"): None,
         # Per-caption token cap lives on the nested SFT dataset, not a top-level
         # dataloader scalar — route it to the get_sft_dataset node.
         ("dataloader_train", "max_caption_tokens"): (
@@ -72,10 +86,16 @@ PATH_REMAPS: dict[str, dict[tuple[str, ...], "tuple[str, ...] | None"]] = {
         # No VLM analog — skip these leaves
         ("model", "max_num_tokens_after_packing"): None,
         ("model", "joint_attn_implementation"): None,
-        ("model", "lora_enabled"): None,
-        ("model", "lora_rank"): None,
-        ("model", "lora_alpha"): None,
-        ("model", "lora_target_modules"): None,
+        ("model", "lora_enabled"): ("model", "config", "policy", "lora_enabled"),
+        ("model", "lora_rank"): ("model", "config", "policy", "lora_rank"),
+        ("model", "lora_alpha"): ("model", "config", "policy", "lora_alpha"),
+        ("model", "lora_dropout"): ("model", "config", "policy", "lora_dropout"),
+        ("model", "lora_target_modules"): ("model", "config", "policy", "lora_target_modules"),
+        ("model", "lora_bias"): ("model", "config", "policy", "lora_bias"),
+        ("model", "lora_use_rslora"): ("model", "config", "policy", "lora_use_rslora"),
+        ("model", "lora_modules_to_save"): ("model", "config", "policy", "lora_modules_to_save"),
+        ("model", "lora_precision"): ("model", "config", "policy", "lora_precision"),
+        ("model", "qwen3_vl_patch_embed"): ("model", "config", "policy", "qwen3_vl_patch_embed"),
         ("model", "tokenizer"): None,                                          # blocks model.tokenizer.*
         ("dataloader_train", "seed"): None,
         ("optimizer", "eps"): None,                                            # VLM_OPTIMIZER_KWARGS has no eps field
@@ -208,5 +228,3 @@ def _hydra_format(v: Any, in_list: bool = False) -> str:
             return f"'{v}'"
         return v
     return str(v)
-
-

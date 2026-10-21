@@ -1,152 +1,37 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
-from typing import Callable
-
 import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 
+from cosmos_framework.model.generator.moe import native
+from cosmos_framework.model.generator.moe.interface import MoEBackendConfig, MoEExperts
+from cosmos_framework.model.generator.moe.native import _run_experts_grouped_mm as _run_experts_grouped_mm
 from cosmos_framework.model.generator.reasoner.qwen3_vl_moe.configuration_qwen3_vl_moe import (
     Qwen3VLMoeTextConfig,
 )
-from cosmos_framework.model.generator.reasoner.qwen3_vl_moe.moe_kernels import (
-    TOKEN_GROUP_ALIGN_SIZE_M,
-    _generate_permute_indices,
-)
 
 
-def _run_experts_grouped_mm(
-    gate_up_proj: torch.Tensor,  # [num_experts,hidden_size,2*moe_intermediate_size]
-    down_proj: torch.Tensor,  # [num_experts,moe_intermediate_size,hidden_size]
-    act_fn: Callable[[torch.Tensor], torch.Tensor],
-    x: torch.Tensor,  # [num_tokens,hidden_size]  (tokens sorted by expert)
-    num_tokens_per_expert: torch.Tensor,  # [num_experts]
-    scores: torch.Tensor,  # [padded_len]
-) -> torch.Tensor:  # [num_tokens,hidden_size]
+class Qwen3VLMoeTextExpertsGroupedMm(native.NativeMoEExperts):
+    """Legacy Qwen entry point for the shared native grouped-MM implementation.
+
+    Keep the config-based constructor and parameter names for existing callers.
+    The inherited forward and reorder methods also support binding to HF expert instances.
     """
-    This function runs the gate/up/down projection in a grouped matrix multiplication fashion.
 
-    Args:
-        gate_up_proj (torch.Tensor): (num_experts, hidden_size, 2 * moe_intermediate_size)
-        down_proj (torch.Tensor): (num_experts, moe_intermediate_size, hidden_size)
-        x (torch.Tensor): (batch_size * seq_len, hidden_size)
-        num_tokens_per_expert (torch.Tensor): (num_experts,)
-        scores (torch.Tensor): (num_tokens,)
-
-    Returns:
-        torch.Tensor: (batch_size * seq_len, hidden_size)
-    """
-    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)  # [num_experts]
-    h = torch._grouped_mm(x, gate_up_proj, offs=offsets)  # [num_tokens,2*moe_intermediate_size]
-    h = torch.chunk(h, chunks=2, dim=-1)  # 2x [num_tokens,moe_intermediate_size]
-    h = act_fn(h[0]) * h[1] * scores.unsqueeze(-1)  # [num_tokens,moe_intermediate_size]
-    return torch._grouped_mm(h, down_proj, offs=offsets)  # [num_tokens,hidden_size]
-
-
-class Qwen3VLMoeTextExpertsGroupedMm(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.gate_up_proj = nn.Parameter(
-            torch.empty(config.num_experts, config.hidden_size, 2 * config.moe_intermediate_size)
+    def __init__(self, config: Qwen3VLMoeTextConfig, top_k: int | None = None) -> None:
+        selected_top_k = config.num_experts_per_tok if top_k is None else top_k
+        assert 1 <= selected_top_k <= config.num_experts, (
+            f"top_k must be in [1, {config.num_experts}], got {selected_top_k}."
         )
-        self.down_proj = nn.Parameter(torch.empty(config.num_experts, config.moe_intermediate_size, config.hidden_size))
-        self.act_fn = ACT2FN[config.hidden_act]
-
-        self.num_experts = config.num_experts
-        self.moe_intermediate_size = config.moe_intermediate_size
-        self.hidden_size = config.hidden_size
-        self.top_k = config.num_experts_per_tok
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,  # [num_tokens,hidden_size]
-        topk_scores: torch.Tensor,  # [num_tokens,top_k]
-        expert_indices: torch.Tensor,  # [num_tokens,top_k]
-        num_tokens_per_expert: torch.Tensor,  # [num_experts]
-    ) -> torch.Tensor:  # [num_tokens,hidden_size]
-        """
-        This module obtains the output of the experts by routing the tokens
-        to the experts and then performing a weighted sum of the output of the experts.
-
-        Args:
-            hidden_states (torch.Tensor): (batch_size * seq_len, hidden_size)
-            topk_scores (torch.Tensor): (batch_size * seq_len, top_k)
-            expert_indices (torch.Tensor): (batch_size * seq_len, top_k)
-
-        Returns:
-            torch.Tensor: (batch_size * seq_len, hidden_size)
-        """
-        num_tokens, dim = hidden_states.shape
-        topk_scores_sorted, token_indices_sorted = self._reorder_tokens(
-            topk_scores,
-            expert_indices,
+        super().__init__(
+            config.hidden_size,
+            config.moe_intermediate_size,
+            config.num_experts,
+            selected_top_k,
+            config.hidden_act,
         )
-        # topk_scores_sorted: [num_tokens*top_k]
-        # token_indices_sorted: [num_tokens*top_k]
-
-        # Build padded permutation indices
-        num_experts = num_tokens_per_expert.shape[0]
-        alignment = TOKEN_GROUP_ALIGN_SIZE_M
-        padded_size = num_tokens * self.top_k + num_experts * alignment
-        padded_size = ((padded_size + alignment - 1) // alignment) * alignment
-
-        permuted_indices, padded_num_tokens_per_expert = _generate_permute_indices(
-            num_tokens_per_expert,
-            num_experts,
-            padded_size,
-            alignment,
-        )
-
-        # Compose: permuted_indices indexes into sorted order,
-        # token_indices_sorted maps sorted→original. Compose them:
-        sentinel = torch.tensor([num_tokens], device=hidden_states.device)  # for padding slots
-        token_indices_ext = torch.cat([token_indices_sorted, sentinel])
-        combined_indices = token_indices_ext[permuted_indices.long()]
-        combined_indices = combined_indices.unsqueeze(-1).expand(-1, dim)
-
-        # Pad scores with a zero sentinel so padding slots contribute nothing
-        scores_ext = torch.cat([topk_scores_sorted, topk_scores_sorted.new_zeros(1)])
-        combined_scores = scores_ext[permuted_indices.long()]  # [padded_len]
-
-        # Single gather (with a zero-padded sentinel row)
-        input_padded = torch.cat([hidden_states, hidden_states.new_zeros(1, dim)])
-        routed_input = input_padded.gather(dim=0, index=combined_indices)
-
-        # Run experts
-        routed_output = _run_experts_grouped_mm(
-            self.gate_up_proj,
-            self.down_proj,
-            self.act_fn,
-            routed_input,
-            padded_num_tokens_per_expert,
-            combined_scores,
-        )
-
-        output_padded = torch.zeros_like(input_padded)
-        output_padded.scatter_add_(dim=0, index=combined_indices, src=routed_output)
-        return output_padded[:-1]
-
-    def _reorder_tokens(
-        self,
-        topk_scores: torch.Tensor,  # [num_tokens,top_k]
-        expert_indices: torch.Tensor,  # [num_tokens,top_k]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Reorder tokens into expert-grouped order via argsort.
-
-        Returns:
-            topk_scores_sorted: [num_tokens*top_k] scores in expert-grouped order.
-            token_indices_sorted: [num_tokens*top_k] original token indices in
-                expert-grouped order.
-        """
-        token_indices_sorted = torch.argsort(expert_indices.view(-1), stable=True)  # [num_tokens*top_k]
-        topk_scores_sorted = topk_scores.view(-1)[token_indices_sorted]  # [num_tokens*top_k]
-        token_indices_sorted = token_indices_sorted // self.top_k  # [num_tokens*top_k]
-        return topk_scores_sorted, token_indices_sorted
-
-    def init_weights(self, buffer_device: torch.device):
-        nn.init.normal_(self.gate_up_proj, mean=0.0, std=0.02)
-        nn.init.normal_(self.down_proj, mean=0.0, std=0.02)
 
 
 class Qwen3VLMoeTextExpertsNaive(nn.Module):
@@ -159,7 +44,6 @@ class Qwen3VLMoeTextExpertsNaive(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
         self.num_experts = config.num_experts
-        self.moe_intermediate_size = config.moe_intermediate_size
         self.hidden_size = config.hidden_size
 
     def forward(
@@ -168,6 +52,7 @@ class Qwen3VLMoeTextExpertsNaive(nn.Module):
         topk_scores: torch.Tensor,  # [num_tokens,top_k]
         expert_indices: torch.Tensor,  # [num_tokens,top_k]
         num_tokens_per_expert: torch.Tensor,  # [num_experts]
+        token_mask: torch.Tensor | None,  # [num_tokens]
     ) -> torch.Tensor:  # [num_tokens,hidden_size]
         """
         When training it is more efficient to just loop over the experts and compute the output for each expert
@@ -180,11 +65,16 @@ class Qwen3VLMoeTextExpertsNaive(nn.Module):
             routing_weights (torch.Tensor): (batch_size * token_num, top_k)
             expert_indices (torch.Tensor): (batch_size * token_num, top_k)
             num_tokens_per_expert (torch.Tensor): (num_experts,)
+            token_mask (torch.Tensor | None): (batch_size * token_num,) boolean, false on padding
+                rows. Ignored here: this reference path computes every row and relies on the caller
+                having given the padding rows a zero score, which contributes nothing to the sum.
+                Skipping their compute is a property of the grouped-GEMM path only.
 
         Returns:
             torch.Tensor: (batch_size * seq_len, hidden_size)
         """
         del num_tokens_per_expert
+        del token_mask
         assert hidden_states.ndim == 2, "hidden_states must be of shape (batch_size * seq_len, hidden_size)"
         assert hidden_states.shape[1] == self.hidden_size, (
             "hidden_states must be of shape (batch_size * seq_len, hidden_size)"
@@ -239,10 +129,24 @@ class Qwen3VLMoeTextExpertsNaive(nn.Module):
         nn.init.normal_(self.down_proj, mean=0.0, std=0.02)
 
 
-def create_text_experts(config: Qwen3VLMoeTextConfig, implementation_type: str = "naive") -> nn.Module:
+def create_text_experts(
+    config: Qwen3VLMoeTextConfig,
+    implementation_type: str = "naive",
+    top_k: int | None = None,
+) -> nn.Module:
     if implementation_type == "naive":
         return Qwen3VLMoeTextExpertsNaive(config)
     elif implementation_type == "grouped_mm":
-        return Qwen3VLMoeTextExpertsGroupedMm(config)
+        return MoEExperts(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            num_experts=config.num_experts,
+            top_k=config.num_experts_per_tok if top_k is None else top_k,
+            activation=config.hidden_act,
+            backend_config=MoEBackendConfig(
+                backend=getattr(config, "moe_backend", "native"),
+                precision=getattr(config, "moe_precision", "bf16"),
+            ),
+        )
     else:
         raise ValueError(f"Invalid implementation: {implementation_type}")

@@ -5,12 +5,14 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
+import tomllib
 from pydantic import ValidationError
 
-from cosmos_framework.configs.toml_config.sft_config import SFTExperimentConfig
+from cosmos_framework.configs.toml_config.sft_config import JobConfig, SFTExperimentConfig
 from cosmos_framework.configs.toml_config.toml_config_helper import build_hydra_overrides
 
 # Representative payload: scalars, a nested sub-table, and an array-of-tables.
@@ -25,6 +27,53 @@ _CUSTOM_PAYLOAD = {
         {"path": "/data/b", "weight": 2.0},
     ],
 }
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+@pytest.mark.level(0)
+@pytest.mark.gpus(0)
+def test_wandb_defaults_are_opt_in() -> None:
+    from cosmos_framework.utils.config import JobConfig as RuntimeJobConfig
+
+    assert RuntimeJobConfig().wandb_mode == "disabled"
+    assert JobConfig(task="vfm", experiment="vision_sft_nano").wandb_mode == "disabled"
+    for mode in ("online", "offline"):
+        assert RuntimeJobConfig(wandb_mode=mode).wandb_mode == mode
+        assert JobConfig(task="vfm", experiment="vision_sft_nano", wandb_mode=mode).wandb_mode == mode
+
+
+@pytest.mark.level(0)
+@pytest.mark.gpus(0)
+@pytest.mark.parametrize(
+    "recipe", sorted((_REPO_ROOT / "examples/toml/sft_config").glob("*.toml")), ids=lambda p: p.name
+)
+def test_shipped_sft_recipes_disable_wandb(recipe: Path) -> None:
+    with recipe.open("rb") as stream:
+        job = JobConfig.model_validate(tomllib.load(stream)["job"])
+    assert job.wandb_mode == "disabled"
+
+
+@pytest.mark.level(0)
+@pytest.mark.gpus(0)
+@pytest.mark.parametrize(
+    "launcher", ["launch_sft_llava_ov_mapstyle_dataloader.sh", "launch_sft_vision_nano_cosmosdataloader.sh"]
+)
+def test_launchers_preserve_toml_wandb_choice(launcher: str) -> None:
+    # Capture the wrapper's overrides without sourcing the common launcher or starting training.
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source() { printf "%s\\n" "${TAIL_OVERRIDES[@]}"; }; builtin source "$1"',
+            "_",
+            str(_REPO_ROOT / "examples" / launcher),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert not any(arg.startswith("job.wandb_mode=") for arg in result.stdout.splitlines())
 
 
 # --------------------------------------------------------------------------- #
@@ -75,6 +124,77 @@ class TestSchemaValidation:
                     "trainer": {"max_iter": 10, "typo_here": True},
                 }
             )
+
+    def test_native_epoch_schedule_fields_validate(self) -> None:
+        cfg = SFTExperimentConfig.model_validate(
+            {
+                "job": {"task": "vlm", "experiment": "cosmos_video_conversation"},
+                "trainer": {
+                    "num_epochs": 2,
+                    "steps_per_epoch": 108,
+                    "validation_freq_in_epoch": 1,
+                },
+                "checkpoint": {
+                    "save_freq_in_epoch": 2,
+                    "dcp_async_mode_enabled": False,
+                },
+            }
+        )
+
+        assert cfg.trainer.num_epochs == 2
+        assert cfg.trainer.steps_per_epoch == 108
+        assert cfg.trainer.validation_freq_in_epoch == 1
+        assert cfg.checkpoint.save_freq_in_epoch == 2
+        assert cfg.checkpoint.dcp_async_mode_enabled is False
+
+        overrides = build_hydra_overrides(
+            {
+                "job": {"task": "vlm", "experiment": "cosmos_video_conversation"},
+                "checkpoint": {"dcp_async_mode_enabled": False},
+            }
+        )
+        assert "checkpoint.dcp_async_mode_enabled=false" in overrides
+
+    def test_vlm_peft_fields_are_explicit_and_validated(self) -> None:
+        cfg = SFTExperimentConfig.model_validate(
+            {
+                "job": {"task": "vlm", "experiment": "cosmos_video_conversation"},
+                "model": {
+                    "lora_enabled": True,
+                    "lora_rank": 8,
+                    "lora_alpha": 16,
+                    "lora_dropout": 0.05,
+                    "lora_target_modules": "q_proj,v_proj",
+                    "lora_bias": "none",
+                    "lora_use_rslora": True,
+                    "lora_modules_to_save": "lm_head",
+                    "lora_precision": "bfloat16",
+                    "qwen3_vl_patch_embed": "linear",
+                },
+            }
+        )
+        assert cfg.model.lora_enabled is True
+        assert cfg.model.lora_rank == 8
+        assert cfg.model.lora_use_rslora is True
+
+    def test_vlm_peft_fields_reach_policy_overrides(self) -> None:
+        overrides = build_hydra_overrides(
+            {
+                "job": {"task": "vlm", "experiment": "cosmos_video_conversation"},
+                "model": {
+                    "lora_enabled": True,
+                    "lora_rank": 8,
+                    "lora_dropout": 0.05,
+                    "lora_bias": "lora_only",
+                    "qwen3_vl_patch_embed": "auto",
+                },
+            }
+        )
+        assert "model.config.policy.lora_enabled=true" in overrides
+        assert "model.config.policy.lora_rank=8" in overrides
+        assert "model.config.policy.lora_dropout=0.05" in overrides
+        assert "model.config.policy.lora_bias=lora_only" in overrides
+        assert "model.config.policy.qwen3_vl_patch_embed=auto" in overrides
 
 
 # --------------------------------------------------------------------------- #

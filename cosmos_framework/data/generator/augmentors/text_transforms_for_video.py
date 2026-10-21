@@ -2,11 +2,14 @@
 # SPDX-License-Identifier: OpenMDW-1.1
 
 import json
+import math
+import os
 import random
+from collections.abc import Mapping, Sequence
 from typing import Optional
 
-from cosmos_framework.data.imaginaire.webdataset.augmentors.v3_text_transforms import pad_and_resize
 from cosmos_framework.data.imaginaire.webdataset.augmentors.augmentor import Augmentor
+from cosmos_framework.data.imaginaire.webdataset.augmentors.v3_text_transforms import pad_and_resize
 from cosmos_framework.utils import log
 
 
@@ -272,6 +275,10 @@ class TextTransformForVideoWithFullFrames(Augmentor):
         return data_dict
 
 
+class CaptionSchemaError(ValueError):
+    """A decoded transfer caption cannot provide the configured representations."""
+
+
 class TextTransformForVideoTransferFullFrames(Augmentor):
     """Read structured captions for the full-frame transfer pipeline.
 
@@ -291,9 +298,11 @@ class TextTransformForVideoTransferFullFrames(Augmentor):
     The full-frame pipeline always decodes from the start of the video, so the
     first chunk is always selected and its inner JSON-encoded structured payload
     is parsed back into a dict before being serialized as ``ai_caption``.
+    A source can opt into ``dense_caption_probability`` to emit that same
+    payload's ``temporal_caption`` as plain text for a fraction of samples.
     """
 
-    CAPTION_FIELD = "caption_structured"
+    CAPTION_FIELD: str = "caption_structured"
 
     def __init__(self, input_keys: dict, output_keys: Optional[list] = None, args: Optional[dict] = None) -> None:
         super().__init__(input_keys, output_keys, args)
@@ -302,17 +311,65 @@ class TextTransformForVideoTransferFullFrames(Augmentor):
         self.args = args or {}
         self.keep_metas = self.args.get("keep_metas", False)
         self.caption_options = self._normalize_caption_config(self.args["caption_config"])
+        for caption_key, _, option in self.caption_options:
+            try:
+                dense_probability = float(option.get("dense_caption_probability", 0.0))
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"Invalid dense_caption_probability for {caption_key!r}.") from error
+            if not math.isfinite(dense_probability) or not 0.0 <= dense_probability <= 1.0:
+                raise ValueError(
+                    f"dense_caption_probability for {caption_key!r} must be finite and in [0, 1], "
+                    f"got {dense_probability}."
+                )
         # This fixes transfer datasets that mix caption chunks with different
         # lengths. Each caption source needs its own stride so the sampled video
         # stays within the token budget while matching the selected caption.
         self.min_stride_key = self.args.get("min_stride_key", "_full_frames_min_stride")
+        self._caption_stats_pid: int = os.getpid()
+        self._caption_attempted: int = 0
+        self._caption_yielded: int = 0
+        self._caption_rejected: dict[str, int] = {}
+
+    def _record_caption_attempt(self) -> None:
+        # Forked DataLoader workers must not inherit counts from the parent.
+        pid = os.getpid()
+        if pid != self._caption_stats_pid:
+            self._caption_stats_pid = pid
+            self._caption_attempted = 0
+            self._caption_yielded = 0
+            self._caption_rejected = {}
+        self._caption_attempted += 1
+
+    def _reject_caption(
+        self,
+        data_dict: dict,
+        reason: str,
+        detail: str,
+        caption_key: str | None = None,
+        chunk_key: str | None = None,
+    ) -> None:
+        count = self._caption_rejected.get(reason, 0) + 1
+        self._caption_rejected[reason] = count
+        # Report zero-yield schema outages immediately, then bound log volume
+        # independently for each reason so decode failures cannot hide them.
+        if count <= 3 or count % 100 == 0:
+            log.warning(
+                f"{type(self).__name__}: {reason}: {detail} "
+                f"caption_source={caption_key!r}, chunk={chunk_key!r}, "
+                f"url: {data_dict.get('__url__')}, key: {data_dict.get('__key__')}; "
+                f"worker-local transform counts (pid={self._caption_stats_pid}): "
+                f"attempted={self._caption_attempted}, yielded={self._caption_yielded}, "
+                f"rejected={self._caption_rejected}. Logging first 3 and every 100 failures per reason.",
+                rank0_only=False,
+            )
 
     @staticmethod
-    def _normalize_caption_config(caption_config: dict | list) -> list[tuple[str, float, dict]]:
-        if isinstance(caption_config, dict):
+    def _normalize_caption_config(caption_config: Mapping | Sequence) -> list[tuple[str, float, dict]]:
+        # LazyCall preserves OmegaConf containers, which implement Mapping rather than dict.
+        if isinstance(caption_config, Mapping):
             options: list[tuple[str, float, dict]] = []
             for caption_key, config in caption_config.items():
-                if isinstance(config, dict):
+                if isinstance(config, Mapping):
                     ratio = config.get("ratio", 1.0)
                     # Keep more than the sampling ratio because source-specific
                     # settings, like min_stride, are part of how caption/video
@@ -326,7 +383,7 @@ class TextTransformForVideoTransferFullFrames(Augmentor):
         for item in caption_config:
             if isinstance(item, str):
                 options.append((item, 1.0, {}))
-            elif isinstance(item, dict):
+            elif isinstance(item, Mapping):
                 caption_key = item.get("key") or item.get("caption_key") or item.get("caption_type") or item.get("name")
                 if caption_key is None:
                     raise ValueError(f"Caption config entry is missing a caption key: {item}")
@@ -344,7 +401,24 @@ class TextTransformForVideoTransferFullFrames(Augmentor):
             return candidate
         return None
 
+    @staticmethod
+    def _format_caption(structured: object, option: dict) -> str:
+        """Choose structured JSON or dense prose from one already-selected chunk."""
+        dense_probability = float(option.get("dense_caption_probability", 0.0))
+        if dense_probability == 0.0:
+            return json.dumps(structured)
+        if not isinstance(structured, dict):
+            raise CaptionSchemaError("Dense caption mixing requires a structured caption dictionary.")
+        dense_caption = structured.get("temporal_caption")
+        if not isinstance(dense_caption, str) or not dense_caption.strip():
+            raise CaptionSchemaError("Dense caption mixing requires a nonempty temporal_caption string.")
+        # Validate both representations before choosing one so malformed dense
+        # captions cannot change the requested mixture through selective rejection.
+        structured_caption = json.dumps(structured)
+        return dense_caption if random.random() < dense_probability else structured_caption
+
     def __call__(self, data_dict: dict) -> dict | None:
+        self._record_caption_attempt()
         meta_dict = data_dict.get(self.meta_key)
 
         available_options: list[tuple[str, float, dict]] = []
@@ -355,11 +429,11 @@ class TextTransformForVideoTransferFullFrames(Augmentor):
                 available_options.append((key, ratio, option))
 
         if not available_options:
-            log.warning(
-                f"TextTransformForVideoTransferFullFrames: none of the configured caption keys "
-                f"{[key for key, _, _ in self.caption_options]} hold a caption dict in metadata/sample keys. "
-                f"url: {data_dict.get('__url__')}, key: {data_dict.get('__key__')}",
-                rank0_only=False,
+            self._reject_caption(
+                data_dict,
+                "missing_source",
+                f"None of the configured caption keys {[key for key, _, _ in self.caption_options]} "
+                "hold a caption dict in metadata/sample keys.",
             )
             return None
 
@@ -371,26 +445,34 @@ class TextTransformForVideoTransferFullFrames(Augmentor):
         sampled_caption_option = next(option for key, _, option in available_options if key == sampled_caption_key)
         caption_dict = self._lookup_caption_dict(data_dict, meta_dict, sampled_caption_key)
         if caption_dict is None or self.CAPTION_FIELD not in caption_dict:
-            log.warning(
-                f"TextTransformForVideoTransferFullFrames: caption dict for {sampled_caption_key} is missing the "
-                f"hardcoded {self.CAPTION_FIELD} field. url: {data_dict.get('__url__')}, key: {data_dict.get('__key__')}",
-                rank0_only=False,
+            self._reject_caption(
+                data_dict,
+                "missing_field",
+                f"Caption dict is missing the hardcoded {self.CAPTION_FIELD} field.",
+                sampled_caption_key,
             )
             return None
 
+        sampled_chunk_key: str | None = None
         try:
             chunks = json.loads(caption_dict[self.CAPTION_FIELD])
-            first_chunk = next(iter(chunks.values()))
+            sampled_chunk_key, first_chunk = next(iter(chunks.items()))
             structured = json.loads(first_chunk["caption"])
+            caption_text = self._format_caption(structured, sampled_caption_option)
+        except CaptionSchemaError as error:
+            self._reject_caption(data_dict, "schema_error", str(error), sampled_caption_key, sampled_chunk_key)
+            return None
         except Exception as e:
-            log.warning(
-                f"TextTransformForVideoTransferFullFrames: failed to decode {sampled_caption_key}.{self.CAPTION_FIELD}. "
-                f"url: {data_dict.get('__url__')}, key: {data_dict.get('__key__')}, error: {e}",
-                rank0_only=False,
+            self._reject_caption(
+                data_dict,
+                "decode_error",
+                f"Failed to decode {self.CAPTION_FIELD}: {e}",
+                sampled_caption_key,
+                sampled_chunk_key,
             )
             return None
 
-        data_dict["ai_caption"] = json.dumps(structured)
+        data_dict["ai_caption"] = caption_text
         data_dict["sampled_caption_style"] = sampled_caption_key
         if "min_stride" in sampled_caption_option:
             # Without this override, 200-frame and 400-frame caption sources
@@ -403,6 +485,7 @@ class TextTransformForVideoTransferFullFrames(Augmentor):
         for caption_key, _, _ in self.caption_options:
             if caption_key in data_dict:
                 del data_dict[caption_key]
+        self._caption_yielded += 1
         return data_dict
 
 
@@ -420,8 +503,37 @@ class TextTransformForVideoTransferChunkedFrames(TextTransformForVideoTransferFu
         # The parser still needs metadata for fps/resolution after this transform.
         self.keep_metas = self.args.get("keep_metas", True)
         self.min_num_frames = int(self.args.get("min_num_frames", 5))
+        self.target_num_frames: int | None = self.args.get("target_num_frames")
+
+    def _supports_target_length(self, start_frame: int, end_frame: int, option: dict, meta_dict: dict) -> bool:
+        """Keep complete caption windows that can be resampled without duplicating frames."""
+        if self.target_num_frames is None:
+            return True
+        if self.target_num_frames < 1 or end_frame - start_frame < self.target_num_frames:
+            return False
+        try:
+            source_num_frames = int(meta_dict["nb_frames"])
+            source_fps = float(meta_dict["framerate"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if start_frame < 0 or end_frame > source_num_frames:
+            return False
+        if self.target_num_frames == 1:
+            # A single generated frame cannot represent an entire multi-frame
+            # caption window, even when VAE alignment maps it to one latent.
+            if end_frame - start_frame != 1:
+                return False
+            stride = 1.0
+        else:
+            stride = (end_frame - start_frame - 1) / (self.target_num_frames - 1)
+        min_stride = int(option.get("min_stride", self.args.get("min_stride", 1)))
+        max_stride = max(int(self.args.get("max_stride", 3)), min_stride)
+        min_fps = float(self.args.get("min_fps", 0.0))
+        max_fps = float(self.args.get("max_fps", float("inf")))
+        return min_stride <= stride <= max_stride and min_fps <= source_fps / stride <= max_fps
 
     def __call__(self, data_dict: dict) -> dict | None:
+        self._record_caption_attempt()
         meta_dict = data_dict.get(self.meta_key)
 
         available_options: list[tuple[str, float, dict]] = []
@@ -432,11 +544,11 @@ class TextTransformForVideoTransferChunkedFrames(TextTransformForVideoTransferFu
                 available_options.append((key, ratio, option))
 
         if not available_options:
-            log.warning(
-                f"TextTransformForVideoTransferChunkedFrames: none of the configured caption keys "
-                f"{[key for key, _, _ in self.caption_options]} hold a caption dict in metadata/sample keys. "
-                f"url: {data_dict.get('__url__')}, key: {data_dict.get('__key__')}",
-                rank0_only=False,
+            self._reject_caption(
+                data_dict,
+                "missing_source",
+                f"None of the configured caption keys {[key for key, _, _ in self.caption_options]} "
+                "hold a caption dict in metadata/sample keys.",
             )
             return None
 
@@ -448,21 +560,19 @@ class TextTransformForVideoTransferChunkedFrames(TextTransformForVideoTransferFu
         sampled_caption_option = next(option for key, _, option in available_options if key == sampled_caption_key)
         caption_dict = self._lookup_caption_dict(data_dict, meta_dict, sampled_caption_key)
         if caption_dict is None or self.CAPTION_FIELD not in caption_dict:
-            log.warning(
-                f"TextTransformForVideoTransferChunkedFrames: caption dict for {sampled_caption_key} is missing the "
-                f"hardcoded {self.CAPTION_FIELD} field. url: {data_dict.get('__url__')}, key: {data_dict.get('__key__')}",
-                rank0_only=False,
+            self._reject_caption(
+                data_dict,
+                "missing_field",
+                f"Caption dict is missing the hardcoded {self.CAPTION_FIELD} field.",
+                sampled_caption_key,
             )
             return None
 
+        sampled_chunk_key: str | None = None
         try:
             chunks = json.loads(caption_dict[self.CAPTION_FIELD])
             if not isinstance(chunks, dict) or len(chunks) == 0:
-                log.warning(
-                    f"TextTransformForVideoTransferChunkedFrames: empty chunk dict for {sampled_caption_key}. "
-                    f"url: {data_dict.get('__url__')}, key: {data_dict.get('__key__')}",
-                    rank0_only=False,
-                )
+                self._reject_caption(data_dict, "empty_chunks", "Expected a nonempty chunk dict.", sampled_caption_key)
                 return None
 
             eligible_chunk_keys: list[str] = []
@@ -472,14 +582,18 @@ class TextTransformForVideoTransferChunkedFrames(TextTransformForVideoTransferFu
                     end_frame = int(chunk["end_frame"])
                 except (KeyError, TypeError, ValueError):
                     continue
-                if end_frame - start_frame >= self.min_num_frames:
+                if end_frame - start_frame >= self.min_num_frames and self._supports_target_length(
+                    start_frame, end_frame, sampled_caption_option, meta_dict
+                ):
                     eligible_chunk_keys.append(chunk_key)
 
             if not eligible_chunk_keys:
-                log.warning(
-                    f"TextTransformForVideoTransferChunkedFrames: no chunks with >= {self.min_num_frames} frames "
-                    f"in {sampled_caption_key}. url: {data_dict.get('__url__')}, key: {data_dict.get('__key__')}",
-                    rank0_only=False,
+                self._reject_caption(
+                    data_dict,
+                    "no_eligible_chunks",
+                    f"No chunks meet min_num_frames={self.min_num_frames} "
+                    f"and target_num_frames={self.target_num_frames} constraints.",
+                    sampled_caption_key,
                 )
                 return None
 
@@ -488,17 +602,31 @@ class TextTransformForVideoTransferChunkedFrames(TextTransformForVideoTransferFu
             chunk_start_frame = int(sampled_chunk["start_frame"])
             chunk_end_frame = int(sampled_chunk["end_frame"])
             structured = json.loads(sampled_chunk["caption"])
+            if self.target_num_frames is not None and not isinstance(structured, dict):
+                raise CaptionSchemaError("Exact target lengths require a structured caption dictionary.")
+            if self.target_num_frames is not None:
+                # Remove source metadata before the downstream augmentor appends
+                # the sampled clip's duration/FPS. Keep the teacher's established
+                # serialized-caption format and preserve all narrative fields.
+                structured.pop("duration", None)
+                structured.pop("fps", None)
+            caption_text = self._format_caption(structured, sampled_caption_option)
+        except CaptionSchemaError as error:
+            self._reject_caption(data_dict, "schema_error", str(error), sampled_caption_key, sampled_chunk_key)
+            return None
         except Exception as e:
-            log.warning(
-                f"TextTransformForVideoTransferChunkedFrames: failed to decode {sampled_caption_key}.{self.CAPTION_FIELD}. "
-                f"url: {data_dict.get('__url__')}, key: {data_dict.get('__key__')}, error: {e}",
-                rank0_only=False,
+            self._reject_caption(
+                data_dict,
+                "decode_error",
+                f"Failed to decode {self.CAPTION_FIELD}: {e}",
+                sampled_caption_key,
+                sampled_chunk_key,
             )
             return None
 
         data_dict["chunk_start_frame"] = chunk_start_frame
         data_dict["chunk_end_frame"] = chunk_end_frame
-        data_dict["ai_caption"] = json.dumps(structured)
+        data_dict["ai_caption"] = caption_text
         data_dict["sampled_caption_style"] = sampled_caption_key
         data_dict["sampled_chunk_key"] = sampled_chunk_key
         if "min_stride" in sampled_caption_option:
@@ -509,20 +637,23 @@ class TextTransformForVideoTransferChunkedFrames(TextTransformForVideoTransferFu
         for caption_key, _, _ in self.caption_options:
             if caption_key in data_dict:
                 del data_dict[caption_key]
+        self._caption_yielded += 1
         return data_dict
 
 
 class TextTransformForVideoJsonCaption(Augmentor):
-    """
-    This augmentor is used to transform the caption from a json string to a string.
-    The caption is assumed to be in the format of a json string.
-    The caption is then transformed to a string by converting the json string to a dictionary and then converting the dictionary to a string.
-    The caption is then returned as a string.
+    """Transform a chunk-keyed caption and expose its matching frame range.
 
-    When ``meta_dict["caption_audio"]`` is present and non-empty, its contents
-    are injected into the caption dict under the ``"audio_description"`` key.
-    This happens after the JSON field dropout so the audio description is
-    preserved whenever upstream metadata provides it.
+    The outer caption is a JSON object keyed by chunk. Inner captions may be
+    structured dictionaries, JSON-encoded dictionaries, or plain prose. Plain
+    prose is normalized to ``{"description": prose}`` so all downstream text
+    transforms receive a dictionary while ``VideoParsingChunkedFrames`` receives
+    the selected chunk's frame boundaries.
+
+    By default, a non-empty metadata audio caption is injected into the caption
+    dictionary. With ``natural_language_caption=True``, the selected chunk's
+    description is emitted as text instead so a downstream AudioCaptionAppender
+    can add the audio caption before a final video metadata section.
     """
 
     def __init__(self, input_keys: dict, output_keys: Optional[list] = None, args: Optional[dict] = None) -> None:
@@ -530,11 +661,12 @@ class TextTransformForVideoJsonCaption(Augmentor):
         assert len(input_keys) >= 2, (
             "TextTransformForVideoJsonCaption augmentor requires at least two input keys: [meta_key, video_key]"
         )
-        self.meta_key = input_keys[0]
-        self.video_key = input_keys[1]
-        self.args = args or {}
-        self.keep_metas = self.args.get("keep_metas", False)
-        self.caption_key = self.args.get("caption_key", "caption")
+        self.meta_key: str = input_keys[0]
+        self.video_key: str = input_keys[1]
+        self.args: dict = args or {}
+        self.keep_metas: bool = self.args.get("keep_metas", False)
+        self.caption_key: str = self.args.get("caption_key", "caption")
+        self.natural_language_caption: bool = self.args.get("natural_language_caption", False)
 
     @staticmethod
     def _json_dict_or_none(raw_caption: object) -> dict | None:
@@ -547,6 +679,25 @@ class TextTransformForVideoJsonCaption(Augmentor):
         except (json.JSONDecodeError, TypeError):
             return None
         return parsed_caption if isinstance(parsed_caption, dict) else None
+
+    @staticmethod
+    def _caption_payload_to_dict(raw_caption: object) -> dict:
+        """Normalize a structured JSON or plain-text chunk caption."""
+        if isinstance(raw_caption, dict):
+            return dict(raw_caption)
+        if not isinstance(raw_caption, str) or not raw_caption.strip():
+            raise ValueError("chunk caption must be a non-empty string or dictionary")
+
+        try:
+            parsed_caption = json.loads(raw_caption)
+        except (json.JSONDecodeError, TypeError):
+            return {"description": raw_caption}
+
+        if isinstance(parsed_caption, dict):
+            return parsed_caption
+        if isinstance(parsed_caption, str) and parsed_caption.strip():
+            return {"description": parsed_caption}
+        raise ValueError("chunk caption JSON must decode to a non-empty string or dictionary")
 
     @staticmethod
     def _frame_count_or_large_bound(meta_dict: dict) -> int:
@@ -630,9 +781,9 @@ class TextTransformForVideoJsonCaption(Augmentor):
 
         Parses the per-chunk caption JSON, randomly samples one chunk, and writes
         the chunk's frame range into ``data_dict`` so a downstream
-        ``VideoParsingChunkedFrames`` can decode only that frame range. When a
-        non-empty ``caption_audio`` field is present in the metadata, it is
-        injected into the caption dict under the ``"audio_description"`` key.
+        ``VideoParsingChunkedFrames`` can decode only that frame range. Output is
+        either the existing structured caption or, when configured, the selected
+        description as natural-language text.
 
         Args:
             data_dict (dict): Input data dict
@@ -688,10 +839,8 @@ class TextTransformForVideoJsonCaption(Augmentor):
             data_dict["chunk_start_frame"] = int(sampled_chunk["start_frame"])
             data_dict["chunk_end_frame"] = int(sampled_chunk["end_frame"])
 
-            if "caption_json" in sampled_chunk:
-                caption_json = sampled_chunk["caption_json"]
-            else:
-                caption_json = json.loads(sampled_chunk["caption"])
+            caption_payload = sampled_chunk.get("caption_json", sampled_chunk.get("caption"))
+            caption_json = self._caption_payload_to_dict(caption_payload)
         except Exception as e:
             log.warning(
                 f"TextTransformForVideoJsonCaption dataloader error -- url: {data_dict.get('__url__')}, key: {data_dict.get('__key__')}\n error {e}",
@@ -705,13 +854,23 @@ class TextTransformForVideoJsonCaption(Augmentor):
                 if random.random() < json_field_dropout_rate:
                     caption_json.pop(key)
 
-        # Inject audio caption from metas as a new field when available. Added after the field
-        # dropout above so it is preserved whenever upstream metadata provides it.
-        audio_caption = self._find_audio_caption(meta_dict)
-        if isinstance(audio_caption, str) and len(audio_caption) > 0:
-            caption_json["audio_description"] = audio_caption
-
-        data_dict["ai_caption"] = caption_json
+        if self.natural_language_caption:
+            caption_text = caption_json.get("description")
+            if not isinstance(caption_text, str) or not caption_text.strip():
+                log.warning(
+                    f"TextTransformForVideoJsonCaption: natural-language chunk is missing a description. "
+                    f"url: {data_dict.get('__url__')}, key: {data_dict.get('__key__')}",
+                    rank0_only=False,
+                )
+                return None
+            data_dict["ai_caption"] = caption_text
+        else:
+            # Inject audio caption from metas as a new field when available. Added after the field
+            # dropout above so it is preserved whenever upstream metadata provides it.
+            audio_caption = self._find_audio_caption(meta_dict)
+            if isinstance(audio_caption, str) and len(audio_caption) > 0:
+                caption_json["audio_description"] = audio_caption
+            data_dict["ai_caption"] = caption_json
 
         # Delete metas unless keep_metas=True (set when downstream augmentors still need them,
         # e.g. VideoParsingChunkedFrames needs framerate/width/height/nb_frames).

@@ -4,7 +4,9 @@
 import importlib
 import os
 import os.path as osp
+import pathlib
 import re
+import sys
 import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
@@ -51,13 +53,16 @@ from cosmos_framework.utils.generator.quantization import apply_quantization_inp
 # Thus these load_model functions are designed with less dependency.
 
 
-def checkpoint_path_to_cached_path(path: str, cache_rootdir: Optional[str] = None) -> str:
+def checkpoint_path_to_cached_path(
+    path: str, cache_rootdir: str | None = None, *, load_ema_to_reg: bool = False
+) -> str:
+    """Cache S3 checkpoints by bucket, object key and the selected weight set."""
     if cache_rootdir is None:
         homedir = os.getenv("HOME") or ""
         cache_rootdir = osp.join(homedir, ".cache/imaginaire4/checkpoints/")
 
     if path.startswith("s3://"):
-        return osp.join(cache_rootdir, path.removeprefix("s3://").split("/", maxsplit=1)[1])
+        return osp.join(cache_rootdir, "ema" if load_ema_to_reg else "regular", path.removeprefix("s3://"))
     else:
         return path
 
@@ -98,6 +103,11 @@ def _is_safetensors_checkpoint(checkpoint_path: str, credential_path: str | None
 def _is_checkpoint_cache_ready(checkpoint_path: str) -> bool:
     """Return True when FileSystemWriter has published its completion metadata."""
     return osp.isfile(osp.join(checkpoint_path, ".metadata"))
+
+
+def _install_pathlib_pickle_compat() -> None:
+    """Load DCP metadata written by Python versions that use ``pathlib._local``."""
+    sys.modules.setdefault("pathlib._local", pathlib)
 
 
 class _CheckpointCacheAction(IntEnum):
@@ -240,6 +250,7 @@ def _load_model(
         log.info("Dropping net_teacher.* keys from inference load target; distillation checkpoints do not save them.")
         state_dict = {key: value for key, value in state_dict.items() if not key.startswith("net_teacher.")}
 
+    _install_pathlib_pickle_compat()
     if checkpoint_path.startswith("s3://"):
         storage_reader = S3StorageReader(
             credential_path=credential_path or "",
@@ -311,6 +322,7 @@ def load_model_from_checkpoint(
     use_cache_checkpoint: bool = False,
     cache_checkpoint_rootdir: Optional[str] = None,
     keys_to_skip_loading: list[str] | None = None,
+    load_lidar_tokenizer: bool = True,
 ) -> tuple[torch.nn.Module, Any]:
     """
     Args:
@@ -351,7 +363,8 @@ def load_model_from_checkpoint(
         seed: Random seed used for initialization (if applicable).
         experiment_opts: Extra experiment/config override options.
         use_cache_checkpoint: If True, locally save & read remote checkpoints to speed up repeated loads.
-            Be aware, the default cache path is $HOME/.cache/imaginaire4/checkpoints/<same s3 path>.
+            The default cache path is $HOME/.cache/imaginaire4/checkpoints/<regular|ema>/<bucket>/<object key>.
+            Legacy caches without weight-set and bucket identity are left intact but not reused.
             Applies to the DCP path only; for safetensors checkpoints a warning is logged
             and caching is skipped (the DCP write cache is not a meaningful round-trip for
             safetensors sources).
@@ -361,7 +374,11 @@ def load_model_from_checkpoint(
             For DCP this is forwarded as-is to ``CustomLoadPlanner`` (substring match).  For
             safetensors each substring is escaped and wrapped as ``.*<substring>.*`` so that
             ``load_vfm_model``'s ``re.fullmatch``-based ``skip_patterns`` reproduces the
-            substring semantics one-for-one.
+            substring semantics one-for-one. This option is incompatible with FSDP CPU offload,
+            which requires the checkpoint load to initialize every parameter.
+
+        load_lidar_tokenizer: Keep the configured LiDAR tokenizer by default. RGB-only
+            inference disables it after config resolution, before model construction.
 
     Returns:
         The loaded model and config
@@ -384,6 +401,10 @@ def load_model_from_checkpoint(
     config_module = get_config_module(config_file)
     config = importlib.import_module(config_module).make_config()
     config = override(config, ["--", f"experiment={experiment_name}"] + experiment_opts)
+    if not load_lidar_tokenizer:
+        # Joint training loaders interpolate tokenizer properties. Resolve those
+        # first, then avoid loading an unused LiDAR VAE for RGB-only inference.
+        config.model.config.lidar_tokenizer = None
 
     if parallelism_config is not None:
         for key, value in parallelism_config.items():
@@ -391,6 +412,12 @@ def load_model_from_checkpoint(
                 setattr(config.model.config.parallelism, key, value)
             else:
                 raise ValueError(f"Key {key} not found in config.model.config.parallelism")
+
+    if getattr(config.model.config.parallelism, "fsdp_cpu_offload", False) and keys_to_skip_loading:
+        raise ValueError(
+            "fsdp_cpu_offload requires the checkpoint load to initialize every parameter; "
+            "keys_to_skip_loading is not supported"
+        )
 
     if compile_config is not None:
         for key, value in compile_config.items():
@@ -434,7 +461,11 @@ def load_model_from_checkpoint(
     torch.backends.cudnn.benchmark = config.trainer.cudnn.benchmark
 
     with misc.timer("instantiate model"):
-        model = instantiate(config.model).cuda()  # type: ignore
+        model = instantiate(config.model)
+        # FSDP CPU offload establishes mixed placement during construction;
+        # recursively moving the model would corrupt its CPU-shard DTensor aliases.
+        if not getattr(config.model.config.parallelism, "fsdp_cpu_offload", False):
+            model = model.cuda()  # type: ignore
         model.on_train_start()
 
     if is_safetensors:
@@ -495,7 +526,9 @@ def load_model_from_checkpoint(
 
         checkpoint_cache_path = None
         if use_cache_checkpoint:
-            checkpoint_cache_path = checkpoint_path_to_cached_path(checkpoint_path, cache_checkpoint_rootdir)
+            checkpoint_cache_path = checkpoint_path_to_cached_path(
+                checkpoint_path, cache_checkpoint_rootdir, load_ema_to_reg=load_ema_to_reg
+            )
 
         if checkpoint_cache_path is None:
             load_model(checkpoint_path)

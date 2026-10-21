@@ -13,6 +13,7 @@ import torch
 from cosmos_framework.model.attention.cudnn.checks import cudnn_attention_check
 from cosmos_framework.model.attention.flash2.checks import flash2_attention_check
 from cosmos_framework.model.attention.flash3.checks import flash3_attention_check
+from cosmos_framework.model.attention.flash4.checks import flash4_attention_check
 from cosmos_framework.model.attention.masks import CausalType
 from cosmos_framework.model.attention.natten.checks import natten_attention_check, natten_multi_dim_attention_check
 from cosmos_framework.model.attention.utils import get_arch_tag
@@ -28,6 +29,7 @@ BACKEND_CHECK_MAP = {
     "natten": natten_attention_check,
     "flash2": flash2_attention_check,
     "flash3": flash3_attention_check,
+    "flash4": flash4_attention_check,
 }
 
 BACKEND_MULTI_DIM_CHECK_MAP = {
@@ -47,6 +49,8 @@ def is_backend_compatible(
     causal_type: CausalType | None,
     is_varlen: bool,
     deterministic: bool = False,
+    return_lse: bool = False,
+    is_compiling: bool = False,
     raise_error: bool = False,
 ) -> bool:
     """
@@ -103,6 +107,8 @@ def is_backend_compatible(
         causal_type=causal_type,
         is_varlen=is_varlen,
         deterministic=deterministic,
+        return_lse=return_lse,
+        is_compiling=is_compiling,
         raise_error=raise_error,
     )
 
@@ -110,7 +116,7 @@ def is_backend_compatible(
 def get_backend_list(arch_tag: int) -> list[str]:
     """
     Returns list of supported backends according to arch tag (attention.utils.get_arch_tag).
-    Backends are ordered based on their known performance levels, so that the best-performing
+    Backends are ordered by rollout priority and known performance, so that the first
     compatible backend is selected.
 
     The returned list can be filtered via environment variable.
@@ -132,14 +138,17 @@ def get_backend_list(arch_tag: int) -> list[str]:
     if arch_tag == 90:
         default_backends = [
             "flash3",
+            "flash4",
             "cudnn",
             "natten",
             "flash2",
         ]
     elif arch_tag in [100, 103]:
+        # Keep Flash4 behind NATTEN during rollout; set I4_ATTN_BACKENDS=flash4 to opt in.
         default_backends = [
             "cudnn",
             "natten",
+            "flash4",
             "flash2",
         ]
     elif arch_tag in [110, 120, 121]:
@@ -173,6 +182,8 @@ def choose_backend(
     causal_type: CausalType | None,
     is_varlen: bool,
     deterministic: bool = False,
+    return_lse: bool = False,
+    is_compiling: bool = False,
     backend: str | None = None,
     raise_error: bool = True,
 ) -> str | None:
@@ -226,6 +237,8 @@ def choose_backend(
             causal_type=causal_type,
             is_varlen=is_varlen,
             deterministic=deterministic,
+            return_lse=return_lse,
+            is_compiling=is_compiling,
             raise_error=raise_error,
         ):
             return backend
@@ -246,6 +259,8 @@ def choose_backend(
             causal_type=causal_type,
             is_varlen=is_varlen,
             deterministic=deterministic,
+            return_lse=return_lse,
+            is_compiling=is_compiling,
             raise_error=False,
         ):
             return backend
